@@ -62,6 +62,18 @@ omarchy bar move dev.reuk.sysstats --section right --before omarchy.power
 Plugins run as unsandboxed code inside `omarchy-shell`. Read `Panel.qml` before
 enabling it — it is a single file and deliberately short on cleverness.
 
+## Remove
+
+```bash
+omarchy plugin remove dev.reuk.sysstats
+```
+
+That deletes `~/.config/omarchy/plugins/dev.reuk.sysstats/` and drops the widget
+from the bar. Nothing else is left behind: the plugin writes no files, no state
+and no configuration of its own, and it installs no packages or services. If you
+added a layout entry by hand, remove it from `bar.layout` in
+`~/.config/omarchy/shell.json`.
+
 ## Settings
 
 Set on the widget's entry in `~/.config/omarchy/shell.json`:
