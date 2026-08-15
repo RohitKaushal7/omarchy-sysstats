@@ -25,10 +25,19 @@ glanceable indicator, not a linear readout; the panel carries exact numbers.
 ## In the panel
 
 - Current load, CPU model, and a rolling average-CPU graph of the last 48 samples
-- Per-core activity
-- Memory: used, free, swap, load average
+- Per-core activity, with load average on the same line
+- Memory: used, free and swap
 - Storage: usage for a chosen mount, plus live read/write throughput
 - A button through to `btop`
+
+The core grid wraps past eight and balances rather than filling rows, so 12
+cores go 6+6 rather than 8+4 and 24 go 8+8+8; blocks shorten once it wraps so a
+large machine does not push the panel off screen.
+
+On hybrid Intel chips the cores are labelled `P0`/`E4` instead of by bare index,
+read from `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus` — the
+separate-PMU interface Alder Lake and later expose. Uniform CPUs and AMD have
+neither path and keep plain numbering.
 
 Click the bar widget to open it. It registers as a normal bar panel, so
 `SUPER + CTRL + <n>` opens it by position and Tab moves between it and the
