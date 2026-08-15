@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.reuk.sysstats",
+  "name": "System stats",
+  "version": "1.0.0",
+  "author": "Rohit Kaushal",
+  "license": "MIT",
+  "description": "CPU, memory and storage meters with a detail panel",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "System stats",
+    "description": "CPU, memory and storage meters with a detail panel",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "interval": 2,
+      "warnAt": 60,
+      "criticalAt": 85,
+      "mount": "/"
+    },
+    "schema": [
+      {
+        "key": "interval",
+        "type": "number",
+        "label": "Refresh interval",
+        "description": "Seconds between /proc samples."
+      },
+      {
+        "key": "mount",
+        "type": "string",
+        "label": "Storage mount",
+        "description": "Mount point reported in the storage section, e.g. / or /home."
+      },
+      {
+        "key": "warnAt",
+        "type": "number",
+        "label": "Warn threshold (%)",
+        "description": "Load at which meters start tinting away from the base foreground."
+      },
+      {
+        "key": "criticalAt",
+        "type": "number",
+        "label": "Critical threshold (%)",
+        "description": "Load at which meters reach the theme's urgent colour."
+      }
+    ]
+  }
+}
