@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "dev.reuk.sysstats",
   "name": "System stats",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Rohit Kaushal",
   "license": "MIT",
-  "description": "CPU, memory and storage meters with a detail panel",
+  "description": "CPU, GPU, NPU, memory and storage meters with a detail panel",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "System stats",
-    "description": "CPU, memory and storage meters with a detail panel",
+    "description": "CPU, GPU, NPU, memory and storage meters with a detail panel",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -22,7 +22,9 @@
       "interval": 2,
       "warnAt": 60,
       "criticalAt": 85,
-      "mount": "/"
+      "mount": "/",
+      "gpuAlertAt": 50,
+      "npuAlertAt": 0
     },
     "schema": [
       {
@@ -48,6 +50,18 @@
         "type": "number",
         "label": "Critical threshold (%)",
         "description": "Load at which meters reach the theme's urgent colour."
+      },
+      {
+        "key": "gpuAlertAt",
+        "type": "number",
+        "label": "GPU alert (%)",
+        "description": "Show a mark over the bar meters while GPU work (busy % x clock / max clock) is above this percentage."
+      },
+      {
+        "key": "npuAlertAt",
+        "type": "number",
+        "label": "NPU alert (%)",
+        "description": "Show a mark over the bar meters while NPU load is above this percentage. 0 marks any NPU activity."
       }
     ]
   }

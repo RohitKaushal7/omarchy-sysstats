@@ -17,8 +17,17 @@
 // /proc is read through a short-lived `sh` rather than a FileView: procfs
 // reports st_size 0, which size-based readers mishandle. CPU deltas are kept
 // here in QML so no sampling sleep is needed.
+//
+// GPUs and NPUs ride on the same `sh`, read with the `read` builtin so they
+// add no processes. GPU load is the share of the tick the GT spent out of
+// RC6 (xe gtidle, i915 rc6_residency) — "awake", which tracks real load
+// closely without the CAP_PERFMON the engine PMU needs or the /proc/*/fdinfo
+// walk per-client accounting costs. amdgpu reports gpu_busy_percent directly.
+// A runtime-suspended device is never read: on a dGPU that read would wake
+// it out of D3 and cost more power than the widget is worth.
 
 import QtQuick
+import QtQuick.Shapes
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -31,6 +40,14 @@ Panel {
   readonly property int refreshMs: Math.max(1, setting("interval", 2)) * 1000
   readonly property real warnAt: Math.max(0, Math.min(1, setting("warnAt", 60) / 100))
   readonly property real criticalAt: Math.max(0.01, Math.min(1, setting("criticalAt", 85) / 100))
+
+  // Bar alert limits, in percent. A mark shows while a device's work (see
+  // accelWork) is above its limit, and nothing else. NPU defaults to 0:
+  // any NPU work at all is worth a mark.
+  readonly property real gpuAlertAt: Math.max(0, Math.min(100, setting("gpuAlertAt", 50)))
+  readonly property real npuAlertAt: Math.max(0, Math.min(100, setting("npuAlertAt", 0)))
+  property bool gpuAlert: false
+  property bool npuAlert: false
   readonly property int historyLength: 48
 
   readonly property color ink: bar ? bar.foreground : Color.foreground
@@ -104,6 +121,10 @@ Panel {
   property real memUsedGb: 0
   property real memTotalGb: 0
   property real memAvailableGb: 0
+  // Reclaimable: page cache and the like the kernel will hand back on
+  // demand. MemAvailable minus MemFree, so apps + cache + free = total.
+  property real memCacheGb: 0
+  property real memCacheFraction: 0
   property real swapUsedGb: 0
   property real swapTotalGb: 0
 
@@ -124,6 +145,208 @@ Panel {
   property real writeBytesPerSec: 0
 
   readonly property string cpuPercentText: Math.round(cpuLoad * 100) + "%"
+
+  // Accelerators, keyed by sysfs node (card0, accel0). accelIds only
+  // changes when a device appears or goes, so the Repeaters keep their
+  // delegates — and their animations — across ticks; per-tick figures live
+  // in accelState and reach the delegates through bindings.
+  property var accelIds: []
+  property var accelState: ({})
+  property var accelHistory: ({})
+  property var accelNames: ({})
+  property var prevAccel: ({})
+
+  // Trace and gauge colours come from the theme's ANSI cyan/magenta/blue so
+  // they follow theme switches; these are the fallbacks for themes without.
+  property color gpuTint: "#5dcaa5"
+  property color gpuAltTint: "#85b7eb"
+  property color npuTint: "#afa9ec"
+
+  function accelKind(id) { return String(id).indexOf("accel") === 0 ? "npu" : "gpu" }
+
+  function accelLabel(id) {
+    var kind = root.accelKind(id)
+    var same = root.accelIds.filter(function(other) { return root.accelKind(other) === kind })
+    var label = kind.toUpperCase()
+    return same.length > 1 ? label + String(id).replace(/^\D+/, "") : label
+  }
+
+  function accelTint(id) {
+    if (root.accelKind(id) === "npu") return root.npuTint
+    var gpus = root.accelIds.filter(function(other) { return root.accelKind(other) === "gpu" })
+    return gpus.indexOf(id) > 0 ? root.gpuAltTint : root.gpuTint
+  }
+
+  function accelPercentText(id) {
+    var s = root.accelState[id]
+    if (!s || s.asleep || s.busy < 0) return "—"
+    return Math.round(s.busy * 100) + "%"
+  }
+
+  // Two label/value pairs for a device's cell beside its gauge.
+  function accelFacts(id) {
+    var s = root.accelState[id]
+    if (!s) return []
+    var clock = s.clockMhz > 0 ? Math.round(s.clockMhz) + " MHz" : "—"
+    if (s.kind === "npu") {
+      return [
+        s.asleep ? ["STATE", "asleep"] : ["CLOCK", clock],
+        ["MEM", s.memBytes >= 0 ? root.bytesText(s.memBytes) : "—"]
+      ]
+    }
+    if (s.asleep) return [["STATE", "asleep"], ["CLOCK", "—"]]
+    return [
+      ["MEDIA", s.media >= 0 ? Math.round(s.media * 100) + "%" : "—"],
+      ["CLOCK", clock]
+    ]
+  }
+
+  function bytesText(bytes) {
+    var b = Math.max(0, bytes)
+    if (b < 1048576) return Math.round(b / 1024) + " KB"
+    if (b < 1073741824) return Math.round(b / 1048576) + " MB"
+    return (b / 1073741824).toFixed(1) + " GB"
+  }
+
+  // Share of the elapsed tick a monotonic counter advanced by, or -1 when
+  // there is no earlier sample to diff against (first tick, a device that
+  // just woke, a counter that reset).
+  function counterShare(prev, next, key, value, unitsPerSecond, elapsed) {
+    next[key] = value
+    var before = prev[key]
+    if (before === undefined || !(elapsed > 0) || !(value >= before)) return -1
+    return Math.max(0, Math.min(1, (value - before) / (elapsed * unitsPerSecond)))
+  }
+
+  function updateAccelerators(records, elapsed) {
+    var prev = root.prevAccel
+    var next = {}
+    var state = {}
+    var ids = []
+
+    for (var i = 0; i < records.length; i++) {
+      var r = records[i]
+      var id = r[1]
+      var s = state[id]
+      if (!s) {
+        s = state[id] = { kind: r[0], asleep: false, busy: -1, media: -1, clock: -1, clockMhz: 0, memBytes: -1 }
+        ids.push(id)
+      }
+
+      if (r[0] === "npu") {
+        // npu <id> <runtime_status> <busy_us> <cur_mhz> <max_mhz> <mem_bytes>
+        s.asleep = r[2] === "suspended"
+        s.busy = root.counterShare(prev, next, id, parseFloat(r[3]), 1e6, elapsed)
+        s.clockMhz = parseFloat(r[4]) || 0
+        var npuMax = parseFloat(r[5]) || 0
+        s.clock = npuMax > 0 ? Math.min(1, s.clockMhz / npuMax) : -1
+        var mem = parseFloat(r[6])
+        s.memBytes = isNaN(mem) ? -1 : mem
+      } else if (r[2] === "suspended") {
+        // Nothing read, so nothing carried into `next`: the counters are
+        // diffed afresh once the device wakes rather than across the nap.
+        s.asleep = true
+      } else if (r[2] === "idle") {
+        // gpu <id> idle <gt-name> <idle_ms> <cur_mhz> <max_mhz>
+        var idle = root.counterShare(prev, next, id + "/" + r[3], parseFloat(r[4]), 1000, elapsed)
+        var awake = idle < 0 ? -1 : 1 - idle
+        // xe splits Lunar Lake and later into a render GT (gt0-rc) and a
+        // media GT (gt1-mc); i915 reports one render GT.
+        if (/-mc$/.test(r[3])) {
+          s.media = awake
+        } else {
+          s.busy = awake
+          s.clockMhz = parseFloat(r[5]) || 0
+          var gpuMax = parseFloat(r[6]) || 0
+          s.clock = gpuMax > 0 ? Math.min(1, s.clockMhz / gpuMax) : -1
+        }
+      } else if (r[2] === "busy") {
+        // gpu <id> busy <percent>
+        s.busy = Math.max(0, Math.min(1, (parseFloat(r[3]) || 0) / 100))
+      }
+    }
+
+    var history = {}
+    for (var j = 0; j < ids.length; j++) {
+      var key = ids[j]
+      var st = state[key]
+      if (st.asleep && st.busy < 0) st.busy = 0
+      var past = root.accelHistory[key] || []
+      if (st.busy >= 0) {
+        past = past.slice(Math.max(0, past.length - root.historyLength + 1))
+        past.push(st.busy)
+      }
+      history[key] = past
+    }
+
+    root.prevAccel = next
+    root.accelState = state
+    root.accelHistory = history
+    if (ids.join(" ") !== root.accelIds.join(" ")) root.accelIds = ids
+
+    root.gpuAlert = root.overLimit(ids, state, "gpu", root.gpuAlertAt)
+    root.npuAlert = root.overLimit(ids, state, "npu", root.npuAlertAt)
+  }
+
+  // True while any device of `kind` works above `limit` percent.
+  function overLimit(ids, state, kind, limit) {
+    for (var i = 0; i < ids.length; i++) {
+      var s = state[ids[i]]
+      if (s.kind === kind && root.accelWork(s) > limit) return true
+    }
+    return false
+  }
+
+  // Work: share of a device's peak capacity in use, in percent — the
+  // awake share scaled by clock against its maximum. Awake alone cannot
+  // tell many tiny jobs at the floor clock (desktop compositing) from real
+  // work, which is what makes the firmware raise the clock. Devices that
+  // report no clock (amdgpu's busy percent, the NPU when idle) count as
+  // plain busy; -1 when there is nothing to judge.
+  function accelWork(s) {
+    if (!s || s.asleep || !(s.busy >= 0)) return -1
+    return s.busy * (s.clock >= 0 ? s.clock : 1) * 100
+  }
+
+  // `lspci -mm` line -> short device name: "Arc 130V/140V" rather
+  // than "Core Ultra 200V Series Processors Arc Graphics 130V/140V GPU".
+  function parseNames(text) {
+    var names = {}
+    var lines = String(text).split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var id = lines[i].split(/\s+/)[0]
+      var quoted = lines[i].match(/"[^"]*"/g)
+      if (!id || !quoted || quoted.length < 3) continue
+
+      var vendor = quoted[1].replace(/"/g, "")
+      var name = quoted[2].replace(/"/g, "")
+      var bracket = name.match(/\[([^\]]+)\]/)
+      if (bracket) name = bracket[1]
+      name = name.replace(/^.*\bProcessors?\s+/, "").replace(/\s+(GPU|Graphics Controller)$/, "")
+      // "Arc 130V/140V", "Radeon 780M": the brand already says graphics.
+      name = name.replace(/^(Arc|Radeon|Iris Xe|UHD)\s+Graphics\b/, "$1")
+
+      var kind = root.accelKind(id).toUpperCase()
+      if (name === "" || name.toUpperCase() === kind) {
+        var vendorShort = /^Advanced Micro/.test(vendor) ? "AMD" : vendor.split(/\s+/)[0]
+        name = vendorShort + " " + kind
+      }
+      names[id] = name
+    }
+    root.accelNames = names
+  }
+
+  function loadPalette(raw) {
+    var keys = {}
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var match = lines[i].match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
+      if (match) keys[match[1]] = match[2]
+    }
+    root.gpuTint = keys.cyan || keys.color6 || "#5dcaa5"
+    root.npuTint = keys.magenta || keys.color5 || "#afa9ec"
+    root.gpuAltTint = keys.blue || keys.color4 || "#85b7eb"
+  }
 
   // Low load stays at the base foreground; past warnAt it ramps toward the
   // theme's urgent colour, reaching it at criticalAt. A ramp rather than
@@ -174,6 +397,7 @@ Panel {
     var lines = String(text).split("\n")
     var memTotalKb = -1
     var memAvailableKb = -1
+    var memFreeKb = -1
     var swapTotalKb = -1
     var swapFreeKb = -1
 
@@ -184,6 +408,7 @@ Panel {
     var nextUptime = -1
     var nextSectorsRead = -1
     var nextSectorsWritten = -1
+    var accelRecords = []
 
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i]
@@ -214,6 +439,8 @@ Panel {
         }
       } else if (line.indexOf("MemTotal:") === 0) {
         memTotalKb = parseFloat(line.replace(/[^0-9]/g, ""))
+      } else if (line.indexOf("MemFree:") === 0) {
+        memFreeKb = parseFloat(line.replace(/[^0-9]/g, ""))
       } else if (line.indexOf("MemAvailable:") === 0) {
         memAvailableKb = parseFloat(line.replace(/[^0-9]/g, ""))
       } else if (line.indexOf("SwapTotal:") === 0) {
@@ -252,6 +479,8 @@ Panel {
           root.eCoreSpec = espec
           root.eCoreSet = root.parseCpuList(espec)
         }
+      } else if (line.indexOf("gpu ") === 0 || line.indexOf("npu ") === 0) {
+        accelRecords.push(line.split(/\s+/))
       }
     }
 
@@ -264,6 +493,11 @@ Panel {
     if (memTotalKb > 0 && memAvailableKb >= 0) {
       root.memTotalGb = gb(memTotalKb)
       root.memAvailableGb = gb(memAvailableKb)
+      if (memFreeKb >= 0) {
+        var cacheKb = Math.max(0, memAvailableKb - memFreeKb)
+        root.memCacheGb = gb(cacheKb)
+        root.memCacheFraction = Math.max(0, Math.min(1, cacheKb / memTotalKb))
+      }
       root.memUsedGb = gb(memTotalKb - memAvailableKb)
       root.memFraction = Math.max(0, Math.min(1, (memTotalKb - memAvailableKb) / memTotalKb))
     }
@@ -271,6 +505,10 @@ Panel {
       root.swapTotalGb = gb(swapTotalKb)
       root.swapUsedGb = gb(swapTotalKb - swapFreeKb)
     }
+
+    // Before the storage block below moves prevUptime on.
+    var tickSeconds = nextUptime >= 0 && root.prevUptime >= 0 ? nextUptime - root.prevUptime : -1
+    root.updateAccelerators(accelRecords, tickSeconds)
 
     // Throughput comes from /proc/uptime rather than the timer interval, so
     // a late or coalesced tick reports the rate over the time that actually
@@ -304,14 +542,35 @@ Panel {
     id: sampler
     command: ["sh", "-c",
       "grep '^cpu' /proc/stat; " +
-      "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo; " +
+      "grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo; " +
       "echo \"loadavg $(cat /proc/loadavg)\"; " +
       "echo \"uptime $(cut -d' ' -f1 /proc/uptime)\"; " +
       "echo \"disk $(df -B1 --output=size,used " + Util.shellQuote(root.diskMount) + " | tail -1)\"; " +
       "awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|mmcblk[0-9]+|vd[a-z]+)$/ {r+=$6; w+=$10} END {print \"dio\", r+0, w+0}' /proc/diskstats; " +
       "echo \"model $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)\"; " +
       "echo \"pcores $(cat /sys/devices/cpu_core/cpus 2>/dev/null)\"; " +
-      "echo \"ecores $(cat /sys/devices/cpu_atom/cpus 2>/dev/null)\""]
+      "echo \"ecores $(cat /sys/devices/cpu_atom/cpus 2>/dev/null)\"; " +
+      // card0-DP-1 and friends are connectors, not devices.
+      "for c in /sys/class/drm/card[0-9]*; do " +
+        "case ${c##*/} in *-*) continue;; esac; d=$c/device; [ -e \"$d\" ] || continue; " +
+        "rs=active; read rs < \"$d/power/runtime_status\"; " +
+        "if [ \"$rs\" = suspended ]; then echo \"gpu ${c##*/} suspended\"; continue; fi; " +
+        "for g in \"$d\"/tile*/gt*; do [ -r \"$g/gtidle/idle_residency_ms\" ] || continue; " +
+          "read n < \"$g/gtidle/name\"; read i < \"$g/gtidle/idle_residency_ms\"; " +
+          "read f < \"$g/freq0/cur_freq\"; read m < \"$g/freq0/rp0_freq\"; " +
+          "echo \"gpu ${c##*/} idle $n $i $f $m\"; done; " +
+        "if [ -r \"$c/gt/gt0/rc6_residency_ms\" ]; then read i < \"$c/gt/gt0/rc6_residency_ms\"; " +
+          "read f < \"$c/gt_cur_freq_mhz\"; read m < \"$c/gt_RP0_freq_mhz\"; " +
+          "echo \"gpu ${c##*/} idle rc $i $f $m\"; fi; " +
+        "if [ -r \"$d/gpu_busy_percent\" ]; then read b < \"$d/gpu_busy_percent\"; echo \"gpu ${c##*/} busy $b\"; fi; " +
+      "done 2>/dev/null; " +
+      // intel_vpu answers these from driver bookkeeping and reports 0 MHz
+      // rather than waking a suspended NPU, so they are safe to read asleep.
+      "for a in /sys/class/accel/accel[0-9]*; do d=$a/device; [ -r \"$d/npu_busy_time_us\" ] || continue; " +
+        "rs=active; read rs < \"$d/power/runtime_status\"; read b < \"$d/npu_busy_time_us\"; " +
+        "read f < \"$d/npu_current_frequency_mhz\"; read m < \"$d/npu_max_frequency_mhz\"; " +
+        "read u < \"$d/npu_memory_utilization\"; echo \"npu ${a##*/} $rs $b $f $m $u\"; " +
+      "done 2>/dev/null"]
     stdout: StdioCollector {
       id: collector
       waitForEnd: true
@@ -319,6 +578,40 @@ Panel {
       // resolve to whatever `text` is in scope, not the collector's own.
       onStreamFinished: root.parse(collector.text)
     }
+  }
+
+  // Device names change with hardware, not per tick: probed once, and again
+  // only when the set of accelerators does.
+  Process {
+    id: nameProbe
+    command: ["sh", "-c",
+      "for c in /sys/class/drm/card[0-9]* /sys/class/accel/accel[0-9]*; do " +
+        "case ${c##*/} in *-*) continue;; esac; [ -e \"$c/device\" ] || continue; " +
+        "s=$(readlink -f \"$c/device\"); echo \"${c##*/} $(lspci -mm -s \"${s##*/}\" 2>/dev/null)\"; " +
+      "done"]
+    stdout: StdioCollector {
+      id: nameCollector
+      waitForEnd: true
+      onStreamFinished: root.parseNames(nameCollector.text)
+    }
+  }
+
+  onAccelIdsChanged: if (accelIds.length > 0 && !nameProbe.running) nameProbe.running = true
+  onAccelHistoryChanged: sparkline.requestPaint()
+
+  // Startup read, then again whenever the theme moves the shell's colours.
+  FileView {
+    id: paletteFile
+    path: Color.currentThemePath + "/colors.toml"
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.loadPalette(text())
+  }
+
+  Connections {
+    target: Color
+    function onAccentChanged() { paletteFile.reload() }
+    function onForegroundChanged() { paletteFile.reload() }
   }
 
   Timer {
@@ -371,11 +664,20 @@ Panel {
     labelVisible: false
     hasVisualContent: true
     tooltipText: "CPU " + root.cpuPercentText + "   ·   RAM " + root.memUsedGb.toFixed(1) + " / " + root.memTotalGb.toFixed(1) + " GB"
+      + root.accelIds.map(function(id) {
+          var kind = root.accelKind(id)
+          var over = kind === "gpu" ? root.gpuAlert : root.npuAlert
+          var limit = kind === "gpu" ? root.gpuAlertAt : root.npuAlertAt
+          var work = Math.round(Math.max(0, root.accelWork(root.accelState[id])))
+          return "   ·   " + root.accelLabel(id) + " " + root.accelPercentText(id)
+            + (over ? " (work " + work + "% > " + limit + "%)" : "")
+        }).join("")
     fixedWidth: vertical ? -1 : root.meterWidth * 2 + root.meterGap + Style.space(14)
     fixedHeight: vertical ? root.meterWidth * 2 + root.meterGap + Style.space(14) : -1
     onPressed: root.toggle()
 
     Grid {
+      id: meterGrid
       anchors.centerIn: parent
       columns: button.vertical ? 1 : 2
       rows: button.vertical ? 2 : 1
@@ -384,6 +686,55 @@ Panel {
 
       Meter { fraction: root.cpuLoad; settleMs: 180 }
       Meter { fraction: root.memFraction; settleMs: 320 }
+    }
+
+    // Alert line over the meters (to their left on a vertical bar),
+    // anchored to them rather than laid out with them: the meters stay
+    // centred in the button whether or not a mark is showing, and the line
+    // sits in the bar's spare height.
+    AlertBaseline {
+      vertical: button.vertical
+      length: button.vertical ? meterGrid.height : meterGrid.width
+      anchors.bottom: button.vertical ? undefined : meterGrid.top
+      anchors.horizontalCenter: button.vertical ? undefined : meterGrid.horizontalCenter
+      anchors.right: button.vertical ? meterGrid.left : undefined
+      anchors.verticalCenter: button.vertical ? meterGrid.verticalCenter : undefined
+      anchors.bottomMargin: Style.space(3)
+      anchors.rightMargin: Style.space(3)
+    }
+  }
+
+  // GPU mark in the GPU trace colour, NPU mark in the NPU's. One alone
+  // spans the whole meter pair; both split it, GPU first, one segment
+  // over each meter.
+  component AlertBaseline: Item {
+    id: baseline
+
+    property bool vertical: false
+    property real length: 0
+    readonly property real thickness: 2
+    readonly property bool both: root.gpuAlert && root.npuAlert
+    readonly property real half: (length - root.meterGap) / 2
+
+    width: vertical ? thickness : length
+    height: vertical ? length : thickness
+
+    AlertSegment {
+      vertical: baseline.vertical
+      thickness: baseline.thickness
+      on: root.gpuAlert
+      color: root.gpuTint
+      start: 0
+      span: baseline.both ? baseline.half : baseline.length
+    }
+
+    AlertSegment {
+      vertical: baseline.vertical
+      thickness: baseline.thickness
+      on: root.npuAlert
+      color: root.npuTint
+      start: baseline.both ? baseline.length - baseline.half : 0
+      span: baseline.both ? baseline.half : baseline.length
     }
   }
 
@@ -411,10 +762,13 @@ Panel {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        spacing: Style.space(14)
+        // Sections are split by a SectionGap rather than a rule: the gap
+        // takes spacing on both sides, so sections sit twice as far apart
+        // as the rows inside them, and the headers do the dividing.
+        spacing: Style.space(12)
 
         PanelHero {
-          title: "Processor"
+          title: "System"
           meta: root.cpuModel !== "" ? root.cpuModel : "CPU"
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
@@ -438,70 +792,118 @@ Panel {
         }
 
         // ---------- Average CPU over time ----------
-        Canvas {
-          id: sparkline
+        // Graph and its legend as one block, so they keep their own spacing.
+        Column {
           width: parent.width
-          height: Style.space(46)
+          spacing: Style.space(14)
 
-          onPaint: {
-            var ctx = getContext("2d")
-            ctx.reset()
+          Canvas {
+            id: sparkline
+            width: parent.width
+            height: Style.space(69)
 
-            var w = width
-            var h = height
-            var points = root.cpuHistory
+            onPaint: {
+              var ctx = getContext("2d")
+              ctx.reset()
 
-            // Quarter gridlines, so a trace has something to be read against.
-            ctx.strokeStyle = root.ink
-            ctx.lineWidth = 1
-            for (var g = 1; g <= 4; g++) {
-              var gy = Math.round(h - (h * g / 4)) + 0.5
-              ctx.globalAlpha = g === 4 ? 0.16 : 0.08
+              var w = width
+              var h = height
+              var points = root.cpuHistory
+
+              // Quarter gridlines, so a trace has something to be read against.
+              ctx.strokeStyle = root.ink
+              ctx.lineWidth = 1
+              for (var g = 1; g <= 4; g++) {
+                var gy = Math.round(h - (h * g / 4)) + 0.5
+                ctx.globalAlpha = g === 4 ? 0.16 : 0.08
+                ctx.beginPath()
+                ctx.moveTo(0, gy)
+                ctx.lineTo(w, gy)
+                ctx.stroke()
+              }
+
+              ctx.globalAlpha = 0.16
               ctx.beginPath()
-              ctx.moveTo(0, gy)
-              ctx.lineTo(w, gy)
+              ctx.moveTo(0, h - 0.5)
+              ctx.lineTo(w, h - 0.5)
               ctx.stroke()
+
+              if (points.length < 2) return
+
+              // Right-aligned: history fills in from the newest edge, so a
+              // freshly started widget does not stretch three samples across
+              // the full width and imply history it does not have.
+              var step = w / (root.historyLength - 1)
+              var offset = w - (points.length - 1) * step
+              var yFor = function(v) { return h - Math.max(1, v * (h - 2)) }
+
+              ctx.globalAlpha = 0.22
+              ctx.beginPath()
+              ctx.moveTo(offset, h)
+              for (var i = 0; i < points.length; i++) ctx.lineTo(offset + i * step, yFor(points[i]))
+              ctx.lineTo(offset + (points.length - 1) * step, h)
+              ctx.closePath()
+              ctx.fillStyle = root.ink
+              ctx.fill()
+
+              ctx.globalAlpha = 1.0
+              ctx.strokeStyle = root.loadColor(points[points.length - 1])
+              ctx.lineWidth = 1.5
+              ctx.beginPath()
+              for (var k = 0; k < points.length; k++) {
+                var x = offset + k * step
+                var y = yFor(points[k])
+                if (k === 0) ctx.moveTo(x, y)
+                else ctx.lineTo(x, y)
+              }
+              ctx.stroke()
+
+              // Accelerators as unfilled traces over the CPU's area, dashed for
+              // GPUs and dotted for NPUs. A device that has sat at zero for the
+              // whole window draws nothing rather than a line along the floor.
+              for (var a = 0; a < root.accelIds.length; a++) {
+                var id = root.accelIds[a]
+                var trace = root.accelHistory[id] || []
+                if (trace.length < 2 || !trace.some(function(v) { return v > 0.01 })) continue
+
+                var traceOffset = w - (trace.length - 1) * step
+                ctx.strokeStyle = root.accelTint(id)
+                root.applyLineStyle(ctx, root.accelKind(id))
+                ctx.beginPath()
+                for (var t = 0; t < trace.length; t++) {
+                  var tx = traceOffset + t * step
+                  var ty = yFor(trace[t])
+                  if (t === 0) ctx.moveTo(tx, ty)
+                  else ctx.lineTo(tx, ty)
+                }
+                ctx.stroke()
+              }
+              root.applyLineStyle(ctx, "cpu")
             }
+          }
 
-            ctx.globalAlpha = 0.16
-            ctx.beginPath()
-            ctx.moveTo(0, h - 0.5)
-            ctx.lineTo(w, h - 0.5)
-            ctx.stroke()
+          // Legend for the traces above; only once there is more than one.
+          Flow {
+            width: parent.width
+            spacing: Style.space(16)
+            visible: root.accelIds.length > 0
 
-            if (points.length < 2) return
+            LegendItem { kind: "cpu"; tint: root.loadColor(root.cpuLoad); label: "CPU " + root.cpuPercentText }
 
-            // Right-aligned: history fills in from the newest edge, so a
-            // freshly started widget does not stretch three samples across
-            // the full width and imply history it does not have.
-            var step = w / (root.historyLength - 1)
-            var offset = w - (points.length - 1) * step
-            var yFor = function(v) { return h - Math.max(1, v * (h - 2)) }
+            Repeater {
+              model: root.accelIds
 
-            ctx.globalAlpha = 0.22
-            ctx.beginPath()
-            ctx.moveTo(offset, h)
-            for (var i = 0; i < points.length; i++) ctx.lineTo(offset + i * step, yFor(points[i]))
-            ctx.lineTo(offset + (points.length - 1) * step, h)
-            ctx.closePath()
-            ctx.fillStyle = root.ink
-            ctx.fill()
-
-            ctx.globalAlpha = 1.0
-            ctx.strokeStyle = root.loadColor(points[points.length - 1])
-            ctx.lineWidth = 1.5
-            ctx.beginPath()
-            for (var k = 0; k < points.length; k++) {
-              var x = offset + k * step
-              var y = yFor(points[k])
-              if (k === 0) ctx.moveTo(x, y)
-              else ctx.lineTo(x, y)
+              LegendItem {
+                required property string modelData
+                kind: root.accelKind(modelData)
+                tint: root.accelTint(modelData)
+                label: root.accelLabel(modelData) + " " + root.accelPercentText(modelData)
+              }
             }
-            ctx.stroke()
           }
         }
 
-        PanelSeparator { foreground: root.bar.foreground }
+        SectionGap {}
 
         // ---------- Per-core activity ----------
         Column {
@@ -529,7 +931,9 @@ Panel {
               : 0
             // Shorter blocks once the grid wraps, so a 24-core machine does
             // not push the rest of the panel off the bottom of the screen.
-            readonly property real blockHeight: root.coreRows > 1 ? Style.space(20) : Style.space(30)
+            // The graph above carries the trend, so these only need to say
+            // which cores are hot; tall idle blocks were mostly empty boxes.
+            readonly property real blockHeight: root.coreRows > 1 ? Style.space(14) : Style.space(20)
 
             Repeater {
               model: root.coreLoads
@@ -579,104 +983,510 @@ Panel {
           }
         }
 
-        PanelSeparator { foreground: root.bar.foreground }
+        SectionGap {}
 
-        // ---------- Memory ----------
-        // Headline percentage on the header line, the bar full width beneath
-        // it, and the supporting figures spread across the row rather than
-        // stacked as a label/value table — three short facts do not need
-        // three lines, and the table left most of the width empty.
+        // ---------- Accelerators ----------
+        // One column per GPU/NPU, split by hairlines. Each gauge's outer arc
+        // is load and its inner arc is clock against the device's maximum:
+        // 30% busy at the floor clock is idling, 30% at full clock is not.
         Column {
           width: parent.width
-          spacing: Style.space(9)
+          spacing: Style.space(10)
+          visible: root.accelIds.length > 0
 
-          SectionHead {
-            title: "MEMORY"
-            value: Math.round(root.memFraction * 100) + "%"
-            valueColor: root.loadColor(root.memFraction)
+          SectionHead { title: "ACCELERATORS" }
+
+          Row {
+            id: accelRow
+            width: parent.width
+            spacing: ruleGap
+
+            readonly property real ruleGap: Style.space(14)
+            readonly property int count: root.accelIds.length
+            readonly property real cellWidth: count > 0
+              ? (width - (count - 1) * (ruleGap * 2 + 1)) / count
+              : 0
+
+            Repeater {
+              model: root.accelIds
+
+              Row {
+                required property string modelData
+                required property int index
+                spacing: accelRow.ruleGap
+
+                Rectangle {
+                  visible: index > 0
+                  width: 1
+                  height: cell.height
+                  color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.12)
+                }
+
+                AccelCell {
+                  id: cell
+                  deviceId: modelData
+                  width: accelRow.cellWidth
+                }
+              }
+            }
           }
+        }
 
-          UsageBar { fraction: root.memFraction }
+        SectionGap { visible: root.accelIds.length > 0 }
 
-          StatRow {
-            Stat { label: "USED"; value: root.memUsedGb.toFixed(1) + " / " + root.memTotalGb.toFixed(1) + " GB" }
-            Stat { label: "FREE"; value: root.memAvailableGb.toFixed(1) + " GB" }
-            Stat {
-              label: "SWAP"
-              value: root.swapTotalGb > 0 ? root.swapUsedGb.toFixed(1) + " GB" : "none"
+        // ---------- Capacity: memory and storage ----------
+        // Things being filled rather than things working, so one compact row
+        // of two columns, the same shape as the accelerators above, instead
+        // of a full section each.
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+
+          SectionHead { title: "CAPACITY" }
+
+          Row {
+            id: capacityRow
+            width: parent.width
+            spacing: Style.space(14)
+
+            readonly property real cellWidth: (width - spacing * 2 - 1) / 2
+
+            CapacityCell {
+              width: capacityRow.cellWidth
+              label: "RAM"
+              fraction: root.memFraction
+              softFraction: root.memCacheFraction
+              usedText: root.memUsedGb.toFixed(1)
+              totalText: root.memTotalGb.toFixed(1) + " GB"
+              detail: "cache " + root.memCacheGb.toFixed(1) + " · "
+                + (root.swapTotalGb > 0 ? "swap " + root.swapUsedGb.toFixed(1) : "no swap")
+            }
+
+            Rectangle {
+              width: 1
+              height: capacityRow.height
+              color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.12)
+            }
+
+            CapacityCell {
+              width: capacityRow.cellWidth
+              label: "DISK " + root.diskMount
+              fraction: root.diskFraction
+              usedText: root.diskUsedGb.toFixed(0)
+              totalText: root.diskTotalGb.toFixed(0) + " GB"
+              detail: "↓ " + root.rateText(root.readBytesPerSec) + " · ↑ " + root.rateText(root.writeBytesPerSec)
             }
           }
         }
 
         PanelSeparator { foreground: root.bar.foreground }
 
-        // ---------- Storage ----------
-        Column {
+        // Footer: btop is a secondary action that Enter already triggers, so
+        // a quiet link rather than a full-width bordered button.
+        Item {
           width: parent.width
-          spacing: Style.space(9)
+          implicitHeight: Math.max(refreshNote.implicitHeight, btopLink.implicitHeight)
 
-          SectionHead {
-            title: "STORAGE"
-            value: Math.round(root.diskFraction * 100) + "%"
-            valueColor: root.loadColor(root.diskFraction)
+          Text {
+            id: refreshNote
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "updated every " + Math.round(root.refreshMs / 1000) + "s"
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
-          UsageBar { fraction: root.diskFraction }
+          Text {
+            id: btopLink
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: "↵ Open btop"
+            color: btopArea.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.15)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.underline: btopArea.containsMouse
 
-          StatRow {
-            Stat {
-              label: root.diskMount.toUpperCase()
-              value: root.diskUsedGb.toFixed(0) + " / " + root.diskTotalGb.toFixed(0) + " GB"
+            MouseArea {
+              id: btopArea
+              anchors.fill: parent
+              anchors.margins: -Style.space(4)
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.openBtop()
             }
-            Stat { label: "READ";  value: "↓ " + root.rateText(root.readBytesPerSec) }
-            Stat { label: "WRITE"; value: "↑ " + root.rateText(root.writeBytesPerSec) }
           }
-        }
-
-        PanelSeparator { foreground: root.bar.foreground }
-
-        Button {
-          width: parent.width
-          iconText: ""
-          iconSize: Style.font.title
-          text: "Open btop"
-          fontSize: Style.font.bodySmall
-          foreground: root.bar.foreground
-          fontFamily: root.bar.fontFamily
-          horizontalPadding: Style.spacing.controlPaddingX
-          verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-          bordered: true
-          onClicked: root.openBtop()
         }
       }
     }
   }
 
-  // Horizontal fill bar shared by the memory and storage columns.
-  component UsageBar: Item {
-    property real fraction: 0
+  // Dash pattern per trace kind, shared by the sparkline and its legend so
+  // a swatch always matches the line it names. Qt's Canvas measures dashes
+  // in multiples of the line width, as QPen does, not in pixels.
+  function applyLineStyle(ctx, kind) {
+    ctx.lineWidth = 1.5
+    if (kind === "gpu") {
+      ctx.lineCap = "butt"
+      ctx.setLineDash([3, 2])
+    } else if (kind === "npu") {
+      ctx.lineCap = "round"
+      ctx.setLineDash([0.01, 2.2])
+    } else {
+      ctx.lineCap = "butt"
+      ctx.setLineDash([])
+    }
+  }
 
-    width: parent ? parent.width : 0
-    implicitHeight: Style.space(8)
+  component LineSwatch: Canvas {
+    property string kind: "cpu"
+    property color tint: root.ink
+
+    width: Style.space(14)
+    height: Style.space(8)
+
+    onTintChanged: requestPaint()
+    onKindChanged: requestPaint()
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      ctx.strokeStyle = tint
+      root.applyLineStyle(ctx, kind)
+      ctx.beginPath()
+      ctx.moveTo(1, height / 2)
+      ctx.lineTo(width - 1, height / 2)
+      ctx.stroke()
+    }
+  }
+
+  component LegendItem: Row {
+    property string kind: "cpu"
+    property color tint: root.ink
+    property string label: ""
+
+    spacing: Style.space(6)
+
+    LineSwatch {
+      anchors.verticalCenter: parent.verticalCenter
+      kind: parent.kind
+      tint: parent.tint
+    }
+
+    Text {
+      anchors.verticalCenter: parent.verticalCenter
+      text: parent.label
+      color: root.bar.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+  }
+
+  // 270° arc from the bottom-left round to the bottom-right, filled to
+  // `fraction`. Round caps leave a dot at zero, so an awake idle device
+  // still shows where its arc starts.
+  component GaugeArc: ShapePath {
+    property real center: 0
+    property real radius: 0
+    property real fraction: 1
+
+    fillColor: "transparent"
+    capStyle: ShapePath.RoundCap
+
+    PathAngleArc {
+      centerX: center
+      centerY: center
+      radiusX: radius
+      radiusY: radius
+      startAngle: 135
+      sweepAngle: 270 * Math.max(0, Math.min(1, fraction))
+    }
+  }
+
+  component Gauge: Item {
+    id: gauge
+
+    property real busy: 0
+    property real clock: -1
+    property color tint: root.ink
+    property bool asleep: false
+    property string centerText: ""
+
+    // Animated copies, so the arcs sweep rather than jump between ticks.
+    property real busyShown: asleep ? 0 : Math.max(0, busy)
+    property real clockShown: asleep ? 0 : Math.max(0, clock)
+    Behavior on busyShown { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+    Behavior on clockShown { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+
+    readonly property real outerStroke: Style.space(5)
+    readonly property real innerStroke: Style.space(3)
+    readonly property real outerRadius: width / 2 - outerStroke / 2
+    readonly property real innerRadius: outerRadius - Style.space(6)
+    readonly property color track: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.12)
+    // Brighter than the outer track, which reads at 0.12 only because it is
+    // more than twice as wide.
+    readonly property color innerTrack: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.28)
+
+    width: Style.space(64)
+    height: width
+
+    Shape {
+      anchors.fill: parent
+      preferredRendererType: Shape.CurveRenderer
+
+      GaugeArc {
+        center: gauge.width / 2
+        radius: gauge.outerRadius
+        strokeWidth: gauge.outerStroke
+        strokeColor: gauge.track
+      }
+      GaugeArc {
+        center: gauge.width / 2
+        radius: gauge.outerRadius
+        strokeWidth: gauge.outerStroke
+        strokeColor: gauge.asleep ? "transparent" : gauge.tint
+        fraction: gauge.busyShown
+      }
+      GaugeArc {
+        center: gauge.width / 2
+        radius: gauge.innerRadius
+        strokeWidth: gauge.innerStroke
+        strokeColor: gauge.innerTrack
+      }
+      GaugeArc {
+        center: gauge.width / 2
+        radius: gauge.innerRadius
+        strokeWidth: gauge.innerStroke
+        strokeColor: gauge.asleep || gauge.clock < 0 ? "transparent" : root.ink
+        fraction: gauge.clockShown
+      }
+    }
+
+    Text {
+      anchors.centerIn: parent
+      text: gauge.centerText
+      color: gauge.asleep ? root.bar.foreground : root.loadColor(gauge.busy)
+      opacity: gauge.asleep ? 0.5 : 1
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      font.bold: true
+    }
+  }
+
+  // Gauge plus name, model and two facts. Dims while the device sleeps
+  // rather than vanishing, so the row does not reflow as an NPU naps.
+  component AccelCell: Row {
+    id: cell
+
+    property string deviceId: ""
+    // Not `state`: that is Item's own state-machine property.
+    readonly property var info: root.accelState[deviceId] || ({})
+    readonly property var facts: root.accelFacts(deviceId)
+    readonly property bool asleep: info.asleep === true
+
+    spacing: Style.space(12)
+    opacity: asleep ? 0.55 : 1
+    Behavior on opacity { NumberAnimation { duration: 240 } }
+
+    Gauge {
+      id: cellGauge
+      anchors.verticalCenter: parent.verticalCenter
+      busy: cell.info.busy !== undefined ? cell.info.busy : 0
+      clock: cell.info.clock !== undefined ? cell.info.clock : -1
+      asleep: cell.asleep
+      tint: root.accelTint(cell.deviceId)
+      centerText: root.accelPercentText(cell.deviceId)
+    }
+
+    Column {
+      anchors.verticalCenter: parent.verticalCenter
+      width: Math.max(0, cell.width - cellGauge.width - cell.spacing)
+      spacing: Style.space(2)
+
+      // The label's colour already ties it to its trace in the graph; the
+      // dash pattern lives only in the legend.
+      Text {
+        text: root.accelLabel(cell.deviceId)
+        color: root.accelTint(cell.deviceId)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        font.letterSpacing: 1.2
+      }
+
+      Text {
+        width: parent.width
+        text: root.accelNames[cell.deviceId] || ""
+        visible: text !== ""
+        color: Qt.darker(root.bar.foreground, 1.4)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      // Two fixed rows rather than a Repeater: the facts are rebuilt every
+      // tick, and a Repeater would tear its delegates down each time.
+      FactRow { pair: cell.facts[0] || ["", ""] }
+      FactRow { pair: cell.facts[1] || ["", ""] }
+    }
+  }
+
+  component FactRow: Row {
+    property var pair: ["", ""]
+    spacing: Style.space(6)
+
+    Text {
+      width: Style.space(40)
+      text: pair[0]
+      color: Qt.darker(root.bar.foreground, 1.4)
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      font.letterSpacing: 1.2
+    }
+
+    Text {
+      text: pair[1]
+      color: root.bar.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+  }
+
+  // Fill bar with an optional second, dimmer segment stacked after the
+  // hard fill: memory apps hold (solid) then reclaimable cache (dim). The
+  // soft bar spans hard + soft and sits under the hard one, so the two
+  // read as one bar without a seam to line up.
+  component SplitBar: Item {
+    id: splitBar
+
+    property real fraction: 0
+    property real softFraction: 0
+
+    readonly property real hard: Math.max(0, Math.min(1, fraction))
+    readonly property real total: Math.max(hard, Math.min(1, fraction + softFraction))
+
+    implicitHeight: Style.space(6)
 
     Rectangle {
-      id: track
       anchors.fill: parent
       radius: height / 2
-      color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.12)
+      color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.12)
     }
 
     Rectangle {
-      anchors.left: track.left
-      anchors.verticalCenter: track.verticalCenter
-      height: track.height
-      width: Math.max(height, track.width * Math.max(0, Math.min(1, parent.fraction)))
+      visible: splitBar.total > splitBar.hard
+      height: parent.height
+      width: Math.max(height, parent.width * splitBar.total)
       radius: height / 2
-      color: root.loadColor(parent.fraction)
+      color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.35)
+      Behavior on width { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+    }
 
+    Rectangle {
+      height: parent.height
+      width: Math.max(height, parent.width * splitBar.hard)
+      radius: height / 2
+      color: root.loadColor(splitBar.fraction)
       Behavior on width { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
       Behavior on color { ColorAnimation { duration: 240 } }
     }
+  }
+
+  // Label and used / total on one line, the bar, then one dim detail line.
+  component CapacityCell: Column {
+    id: capacityCell
+
+    property string label: ""
+    property real fraction: 0
+    property real softFraction: 0
+    property string usedText: ""
+    property string totalText: ""
+    property string detail: ""
+
+    spacing: Style.space(7)
+
+    Item {
+      width: capacityCell.width
+      height: Math.max(cellLabel.implicitHeight, cellFigure.implicitHeight)
+
+      Text {
+        id: cellLabel
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: Math.max(0, parent.width - cellFigure.implicitWidth - Style.space(8))
+        text: capacityCell.label.toUpperCase()
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        font.letterSpacing: 1.2
+        elide: Text.ElideRight
+      }
+
+      Row {
+        id: cellFigure
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+
+        Text {
+          text: capacityCell.usedText
+          color: root.loadColor(capacityCell.fraction)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          Behavior on color { ColorAnimation { duration: 240 } }
+        }
+
+        Text {
+          text: " / " + capacityCell.totalText
+          color: Qt.darker(root.bar.foreground, 1.4)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+    }
+
+    SplitBar {
+      width: capacityCell.width
+      fraction: capacityCell.fraction
+      softFraction: capacityCell.softFraction
+    }
+
+    Text {
+      width: capacityCell.width
+      text: capacityCell.detail
+      color: Qt.darker(root.bar.foreground, 1.4)
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+  }
+
+  // Zero-height on purpose: Column spacing on either side is the gap.
+  component SectionGap: Item {
+    width: 1
+    height: 0
+  }
+
+  // One coloured run of the alert baseline, positioned along its axis.
+  component AlertSegment: Rectangle {
+    property bool vertical: false
+    property real thickness: 2
+    property bool on: false
+    property real start: 0
+    property real span: 0
+
+    x: vertical ? 0 : start
+    y: vertical ? start : 0
+    width: vertical ? thickness : span
+    height: vertical ? span : thickness
+    radius: thickness / 2
+    opacity: on ? 1 : 0
+
+    Behavior on opacity { NumberAnimation { duration: 200 } }
+    Behavior on start { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+    Behavior on span { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
   }
 
   // Section header with a headline figure on the trailing edge. Reuses
@@ -711,60 +1521,6 @@ Panel {
       font.bold: true
 
       Behavior on color { ColorAnimation { duration: 240 } }
-    }
-  }
-
-  // Equal-width cells across the full panel width. Reading down a column of
-  // labels beats reading across a sparse two-column table, and it fills the
-  // space a right-aligned value list wasted.
-  // An Item rather than a Row: the cells are placed by hand so they divide
-  // the panel evenly, and Row derives implicitHeight from its children,
-  // making it read-only.
-  component StatRow: Item {
-    width: parent ? parent.width : 0
-    implicitHeight: childrenRect.height
-
-    onWidthChanged: layoutCells()
-    onChildrenChanged: layoutCells()
-    Component.onCompleted: layoutCells()
-
-    function layoutCells() {
-      var cells = children
-      if (cells.length === 0 || width <= 0) return
-      var cellWidth = width / cells.length
-      for (var i = 0; i < cells.length; i++) {
-        cells[i].x = i * cellWidth
-        cells[i].y = 0
-        cells[i].width = cellWidth
-      }
-    }
-  }
-
-  // One figure: a dim small-caps label over its value.
-  component Stat: Column {
-    property string label: ""
-    property string value: ""
-
-    spacing: Style.space(3)
-
-    Text {
-      text: parent.label
-      color: Qt.darker(root.bar.foreground, 1.4)
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-      font.bold: true
-      font.letterSpacing: 1.2
-      elide: Text.ElideRight
-      width: parent.width
-    }
-
-    Text {
-      text: parent.value
-      color: root.bar.foreground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideRight
-      width: parent.width
     }
   }
 }
