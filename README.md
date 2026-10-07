@@ -46,9 +46,12 @@ readout. The panel carries exact numbers.
 - **System**: CPU load and model, and a graph of the last 48 samples with the
   GPU and NPU traced over the CPU. A chip that has done nothing in that window
   draws no line.
-- **Cores**: per-core activity with the load average alongside. On hybrid Intel
-  chips the cores are labelled `P0` and `E4` rather than by bare index. The
-  grid wraps past eight and balances, so 12 cores go 6+6 rather than 8+4.
+- **Cores**: per-core activity with the CPU package temperature and the load
+  average alongside. On hybrid Intel chips the cores are labelled `P0` and `E4`
+  rather than by bare index. The grid wraps past eight and balances, so 12
+  cores go 6+6 rather than 8+4. While the chip is slowing itself down for heat,
+  the header adds *throttled N%*: the share of the last 30 seconds spent
+  throttled, shown only from 1% so a lone burst does not flash it.
 - **Accelerators**: a gauge per GPU and NPU, with the model, media-engine load
   and clock for the GPU, and clock and memory for the NPU. An NPU that has
   powered down dims and reads *asleep* rather than a misleading 0%. Machines
@@ -156,6 +159,10 @@ sysfs with the `read` builtin so they start no extra processes:
 - `amdgpu`: `gpu_busy_percent`
 - `intel_vpu`: `npu_busy_time_us`, `npu_current_frequency_mhz`,
   `npu_max_frequency_mhz`, `npu_memory_utilization`
+- temperature: `temp1_input` of the `coretemp`, `k10temp` or `zenpower` hwmon
+  device. ACPI, embedded-controller and NVMe sensors are left alone: each read
+  costs milliseconds, and an NVMe read can wake the drive.
+- throttling: `cpu0/thermal_throttle/package_throttle_total_time_ms`, Intel only
 
 Each sample uses only `coreutils`, `awk` and `grep`, all part of a base Arch
 install. `lspci`, from `pciutils`, runs once at startup to name the devices.

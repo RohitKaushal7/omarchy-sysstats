@@ -131,6 +131,20 @@ Panel {
   property string loadAverage: ""
   property string cpuModel: ""
 
+  // CPU package temperature, and the share of the last throttleWindow
+  // seconds the package spent slowed for heat. The share, not the
+  // temperature, is what says whether heat is costing speed: a hot chip
+  // that is not throttling is working as designed. It is shown only past
+  // throttleFloor so a lone sub-second burst does not flash the label.
+  property real cpuTempC: -1
+  readonly property real throttleWindow: 30
+  readonly property real throttleFloor: 0.01
+  property var throttleSamples: []
+  property real throttleShare: 0
+  readonly property string cpuTempText: cpuTempC >= 0 ? Math.round(cpuTempC) + "°C" : ""
+  readonly property string throttleText: throttleShare >= throttleFloor
+    ? "· throttled " + Math.round(throttleShare * 100) + "%" : ""
+
   // Storage. Usage is for one mount (configurable); throughput is summed
   // across whole block devices, ignoring partitions so their I/O is not
   // counted twice alongside the disk they sit on.
@@ -393,6 +407,24 @@ Panel {
     return { busy: total - idle, total: total }
   }
 
+  // Keeps one sample at or before the window's start, so the share covers
+  // the whole window rather than only the samples that fall inside it.
+  function updateThrottle(uptime, throttleMs) {
+    var samples = root.throttleSamples.slice()
+    // A smaller counter or clock means a resume or reload; start over.
+    var last = samples.length > 0 ? samples[samples.length - 1] : null
+    if (last && (uptime <= last.t || throttleMs < last.ms)) samples = []
+    samples.push({ t: uptime, ms: throttleMs })
+    while (samples.length > 2 && samples[1].t <= uptime - root.throttleWindow) samples.shift()
+    root.throttleSamples = samples
+
+    var first = samples[0]
+    var span = uptime - first.t
+    root.throttleShare = span > 0
+      ? Math.max(0, Math.min(1, (throttleMs - first.ms) / (span * 1000)))
+      : 0
+  }
+
   function parse(text) {
     var lines = String(text).split("\n")
     var memTotalKb = -1
@@ -409,6 +441,7 @@ Panel {
     var nextSectorsRead = -1
     var nextSectorsWritten = -1
     var accelRecords = []
+    var throttleMs = -1
 
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i]
@@ -481,8 +514,15 @@ Panel {
         }
       } else if (line.indexOf("gpu ") === 0 || line.indexOf("npu ") === 0) {
         accelRecords.push(line.split(/\s+/))
+      } else if (line.indexOf("ctemp ") === 0) {
+        var milli = parseFloat(line.substr(6))
+        if (!isNaN(milli)) root.cpuTempC = milli / 1000
+      } else if (line.indexOf("throttle ") === 0) {
+        throttleMs = parseFloat(line.substr(9))
       }
     }
+
+    if (nextUptime >= 0 && throttleMs >= 0) root.updateThrottle(nextUptime, throttleMs)
 
     root.prevCoreBusy = nextCoreBusy
     root.prevCoreTotal = nextCoreTotal
@@ -570,7 +610,16 @@ Panel {
         "rs=active; read rs < \"$d/power/runtime_status\"; read b < \"$d/npu_busy_time_us\"; " +
         "read f < \"$d/npu_current_frequency_mhz\"; read m < \"$d/npu_max_frequency_mhz\"; " +
         "read u < \"$d/npu_memory_utilization\"; echo \"npu ${a##*/} $rs $b $f $m $u\"; " +
-      "done 2>/dev/null"]
+      "done 2>/dev/null; " +
+      // temp1 is the package sensor on coretemp ("Package id 0") and the
+      // control temperature on k10temp/zenpower (Tctl). Both are cheap
+      // cached reads, unlike the ACPI, EC and NVMe sensors beside them.
+      "for h in /sys/class/hwmon/hwmon*; do read n < \"$h/name\"; " +
+        "case $n in coretemp|k10temp|zenpower) read t < \"$h/temp1_input\" && echo \"ctemp $t\"; break;; esac; " +
+      "done 2>/dev/null; " +
+      // Intel only; elsewhere the line is simply absent.
+      "read t < /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms 2>/dev/null " +
+        "&& echo \"throttle $t\""]
     stdout: StdioCollector {
       id: collector
       waitForEnd: true
@@ -916,6 +965,8 @@ Panel {
           // section header is otherwise dead space.
           SectionHead {
             title: "CORES"
+            note: root.cpuTempText
+            alert: root.throttleText
             value: root.loadAverage !== "" ? "LOAD  " + root.loadAverage : ""
           }
 
@@ -1496,6 +1547,10 @@ Panel {
     property string title: ""
     property string value: ""
     property color valueColor: root.bar.foreground
+    // Optional figures right after the title, the alert half in the
+    // theme's urgent colour.
+    property string note: ""
+    property string alert: ""
 
     width: parent ? parent.width : 0
     implicitHeight: Math.max(headLabel.implicitHeight, headValue.implicitHeight)
@@ -1507,6 +1562,31 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       foreground: root.bar.foreground
       fontFamily: root.bar.fontFamily
+    }
+
+    Row {
+      anchors.left: headLabel.right
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(6)
+
+      Text {
+        text: parent.parent.note
+        visible: text !== ""
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
+
+      Text {
+        text: parent.parent.alert
+        visible: text !== ""
+        color: root.bar.urgent
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
     }
 
     Text {

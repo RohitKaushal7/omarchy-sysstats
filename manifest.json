@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dev.reuk.sysstats",
   "name": "System stats",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Rohit Kaushal",
   "license": "MIT",
   "description": "CPU, GPU, NPU, memory and storage meters with a detail panel",
