@@ -58,9 +58,14 @@ readout. The panel carries exact numbers.
   without one simply leave the column out.
 - **Capacity**: memory and the chosen mount side by side. The memory bar is
   split: solid for what apps hold, dim for cache the kernel will hand back on
-  demand. Swap, and disk read and write rates, sit underneath.
+  demand. The disk side leads with free space, as `df` reports it, so the
+  figure already allows for space the filesystem holds back. Swap sits under
+  memory; used of total, and read and write rates, sit under the disk.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
+Click *Disk usage* to browse what fills the chosen mount in a floating
+terminal. A full scan of `/` takes a while (around 15 seconds on a laptop with
+400 GB in use) before the tree appears.
 
 Click the bar widget to open the panel. It registers as a normal bar panel, so
 `SUPER + CTRL + <n>` opens it by position and Tab moves between it and its
@@ -166,7 +171,9 @@ sysfs with the `read` builtin so they start no extra processes:
 
 Each sample uses only `coreutils`, `awk` and `grep`, all part of a base Arch
 install. `lspci`, from `pciutils`, runs once at startup to name the devices.
-`btop` is needed only if you open it.
+`btop` is needed only if you open it. *Disk usage* runs
+[`dua`](https://github.com/Byron/dua-cli), or `gdu` or `ncdu` if one of those
+is what you have, and offers to install `dua-cli` if none is.
 
 A whole sample costs about 14 ms of CPU, the GPU and NPU reads about 1 ms of
 that. `/proc` is read through a subprocess rather than a `FileView` because

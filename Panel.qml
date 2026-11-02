@@ -151,6 +151,9 @@ Panel {
   readonly property string diskMount: setting("mount", "/")
   property real diskTotalGb: 0
   property real diskUsedGb: 0
+  // What df says is free, not total minus used: btrfs and ext4 both keep
+  // space back that neither column counts, so the difference overstates it.
+  property real diskFreeGb: 0
   property real diskFraction: 0
   property real prevUptime: -1
   property real prevSectorsRead: -1
@@ -489,9 +492,11 @@ Panel {
         var d = line.split(/\s+/)
         var totalBytes = parseFloat(d[1])
         var usedBytes = parseFloat(d[2])
+        var freeBytes = parseFloat(d[3])
         if (totalBytes > 0 && usedBytes >= 0) {
           root.diskTotalGb = bytesToGb(totalBytes)
           root.diskUsedGb = bytesToGb(usedBytes)
+          root.diskFreeGb = freeBytes >= 0 ? bytesToGb(freeBytes) : bytesToGb(totalBytes - usedBytes)
           root.diskFraction = Math.max(0, Math.min(1, usedBytes / totalBytes))
         }
       } else if (line.indexOf("dio ") === 0) {
@@ -571,6 +576,25 @@ Panel {
     root.close()
   }
 
+  // Browse what fills the storage mount in a floating terminal (TUI.float is
+  // the app-id Omarchy floats); the mount arrives as $1. dua first, then gdu or
+  // ncdu if one of those is what's installed; with none, offer to install
+  // dua-cli. Not --stay-on-filesystem: btrfs subvolumes such as /home count as
+  // other filesystems. dua and gdu skip /proc, /dev, /sys and /run by default.
+  readonly property string diskUsageScript:
+    "if command -v dua >/dev/null; then exec dua interactive \"$1\"; " +
+    "elif command -v gdu >/dev/null; then exec gdu \"$1\"; " +
+    "elif command -v ncdu >/dev/null; then exec ncdu --exclude-kernfs \"$1\"; fi; " +
+    "read -rp 'No disk usage analyzer found. Install dua-cli? [y/N] ' a; " +
+    "case $a in [yY]*) omarchy-pkg-add dua-cli && exec dua interactive \"$1\";; esac; " +
+    "read -rsn1 -p 'Press any key to close.'"
+
+  function openDiskUsage() {
+    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=TUI.float bash -c "
+      + Util.shellQuote(root.diskUsageScript) + " disk-usage " + Util.shellQuote(root.diskMount))
+    root.close()
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -585,7 +609,7 @@ Panel {
       "grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo; " +
       "echo \"loadavg $(cat /proc/loadavg)\"; " +
       "echo \"uptime $(cut -d' ' -f1 /proc/uptime)\"; " +
-      "echo \"disk $(df -B1 --output=size,used " + Util.shellQuote(root.diskMount) + " | tail -1)\"; " +
+      "echo \"disk $(df -B1 --output=size,used,avail " + Util.shellQuote(root.diskMount) + " | tail -1)\"; " +
       "awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|mmcblk[0-9]+|vd[a-z]+)$/ {r+=$6; w+=$10} END {print \"dio\", r+0, w+0}' /proc/diskstats; " +
       "echo \"model $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)\"; " +
       "echo \"pcores $(cat /sys/devices/cpu_core/cpus 2>/dev/null)\"; " +
@@ -1107,8 +1131,8 @@ Panel {
               label: "RAM"
               fraction: root.memFraction
               softFraction: root.memCacheFraction
-              usedText: root.memUsedGb.toFixed(1)
-              totalText: root.memTotalGb.toFixed(1) + " GB"
+              figureText: root.memUsedGb.toFixed(1)
+              figureSuffix: " / " + root.memTotalGb.toFixed(1) + " GB"
               detail: "cache " + root.memCacheGb.toFixed(1) + " · "
                 + (root.swapTotalGb > 0 ? "swap " + root.swapUsedGb.toFixed(1) : "no swap")
             }
@@ -1123,20 +1147,26 @@ Panel {
               width: capacityRow.cellWidth
               label: "DISK " + root.diskMount
               fraction: root.diskFraction
-              usedText: root.diskUsedGb.toFixed(0)
-              totalText: root.diskTotalGb.toFixed(0) + " GB"
-              detail: "↓ " + root.rateText(root.readBytesPerSec) + " · ↑ " + root.rateText(root.writeBytesPerSec)
+              // Free leads here: on a disk the question is how much room is left.
+              figureText: root.diskFreeGb.toFixed(0)
+              figureSuffix: " GB free"
+              // Used bright, total dim, so the pair reads as used of total
+              // without the words; arrows hug their rates to fit the column.
+              detailLead: root.diskUsedGb.toFixed(0)
+              detail: "/" + root.diskTotalGb.toFixed(0)
+                + " · ↓" + root.rateText(root.readBytesPerSec)
+                + " ↑" + root.rateText(root.writeBytesPerSec)
             }
           }
         }
 
         PanelSeparator { foreground: root.bar.foreground }
 
-        // Footer: btop is a secondary action that Enter already triggers, so
-        // a quiet link rather than a full-width bordered button.
+        // Footer: btop and the disk browser are secondary actions (Enter
+        // already opens btop), so quiet links rather than bordered buttons.
         Item {
           width: parent.width
-          implicitHeight: Math.max(refreshNote.implicitHeight, btopLink.implicitHeight)
+          implicitHeight: Math.max(refreshNote.implicitHeight, footerLinks.implicitHeight)
 
           Text {
             id: refreshNote
@@ -1148,23 +1178,20 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
-          Text {
-            id: btopLink
+          Row {
+            id: footerLinks
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ Open btop"
-            color: btopArea.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.15)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            font.underline: btopArea.containsMouse
+            spacing: Style.space(18)
 
-            MouseArea {
-              id: btopArea
-              anchors.fill: parent
-              anchors.margins: -Style.space(4)
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.openBtop()
+            FooterLink {
+              text: "Disk usage"
+              onActivated: root.openDiskUsage()
+            }
+
+            FooterLink {
+              text: "↵ Open btop"
+              onActivated: root.openBtop()
             }
           }
         }
@@ -1444,15 +1471,16 @@ Panel {
     }
   }
 
-  // Label and used / total on one line, the bar, then one dim detail line.
+  // Label and its figure on one line, the bar, then one dim detail line.
   component CapacityCell: Column {
     id: capacityCell
 
     property string label: ""
     property real fraction: 0
     property real softFraction: 0
-    property string usedText: ""
-    property string totalText: ""
+    property string figureText: ""
+    property string figureSuffix: ""
+    property string detailLead: ""
     property string detail: ""
 
     spacing: Style.space(7)
@@ -1481,7 +1509,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
-          text: capacityCell.usedText
+          text: capacityCell.figureText
           color: root.loadColor(capacityCell.fraction)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -1490,7 +1518,7 @@ Panel {
         }
 
         Text {
-          text: " / " + capacityCell.totalText
+          text: capacityCell.figureSuffix
           color: Qt.darker(root.bar.foreground, 1.4)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -1504,13 +1532,46 @@ Panel {
       softFraction: capacityCell.softFraction
     }
 
-    Text {
+    // An optional bright lead, then the dim rest, which elides if it runs long.
+    Row {
       width: capacityCell.width
-      text: capacityCell.detail
-      color: Qt.darker(root.bar.foreground, 1.4)
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-      elide: Text.ElideRight
+
+      Text {
+        id: detailLeadText
+        text: capacityCell.detailLead
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        width: Math.max(0, capacityCell.width - detailLeadText.implicitWidth)
+        text: capacityCell.detail
+        color: Qt.darker(root.bar.foreground, 1.4)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+  }
+
+  component FooterLink: Text {
+    id: footerLink
+
+    signal activated()
+
+    color: linkArea.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.15)
+    font.family: root.bar.fontFamily
+    font.pixelSize: Style.font.caption
+    font.underline: linkArea.containsMouse
+
+    MouseArea {
+      id: linkArea
+      anchors.fill: parent
+      anchors.margins: -Style.space(4)
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: footerLink.activated()
     }
   }
 
