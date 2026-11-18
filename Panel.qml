@@ -726,8 +726,8 @@ Panel {
       radius: width / 2
       color: root.loadColor(parent.fraction)
 
-      Behavior on height { NumberAnimation { duration: settleMs; easing.type: Easing.OutCubic } }
-      Behavior on color { ColorAnimation { duration: 240 } }
+      Behavior on height { NumberAnimation { duration: Style.duration(settleMs); easing.type: Easing.OutCubic } }
+      Behavior on color { ColorAnimation { duration: Style.duration(240) } }
     }
   }
 
@@ -851,7 +851,7 @@ Panel {
             color: root.loadColor(root.cpuLoad)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.display
-            Behavior on color { ColorAnimation { duration: 240 } }
+            Behavior on color { ColorAnimation { duration: Style.duration(240) } }
           }
 
           trailingControl: Text {
@@ -860,7 +860,7 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.displayLarge
             font.bold: true
-            Behavior on color { ColorAnimation { duration: 240 } }
+            Behavior on color { ColorAnimation { duration: Style.duration(240) } }
           }
         }
 
@@ -1039,8 +1039,8 @@ Panel {
                     radius: Style.cornerRadius
                     color: root.loadColor(modelData)
 
-                    Behavior on height { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-                    Behavior on color { ColorAnimation { duration: 240 } }
+                    Behavior on height { NumberAnimation { duration: Style.duration(200); easing.type: Easing.OutCubic } }
+                    Behavior on color { ColorAnimation { duration: Style.duration(240) } }
                   }
                 }
 
@@ -1293,8 +1293,8 @@ Panel {
     // Animated copies, so the arcs sweep rather than jump between ticks.
     property real busyShown: asleep ? 0 : Math.max(0, busy)
     property real clockShown: asleep ? 0 : Math.max(0, clock)
-    Behavior on busyShown { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
-    Behavior on clockShown { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+    Behavior on busyShown { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
+    Behavior on clockShown { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
 
     readonly property real outerStroke: Style.space(5)
     readonly property real innerStroke: Style.space(3)
@@ -1364,7 +1364,7 @@ Panel {
 
     spacing: Style.space(12)
     opacity: asleep ? 0.55 : 1
-    Behavior on opacity { NumberAnimation { duration: 240 } }
+    Behavior on opacity { NumberAnimation { duration: Style.duration(240) } }
 
     Gauge {
       id: cellGauge
@@ -1458,7 +1458,7 @@ Panel {
       width: Math.max(height, parent.width * splitBar.total)
       radius: height / 2
       color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.35)
-      Behavior on width { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+      Behavior on width { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
     }
 
     Rectangle {
@@ -1466,8 +1466,8 @@ Panel {
       width: Math.max(height, parent.width * splitBar.hard)
       radius: height / 2
       color: root.loadColor(splitBar.fraction)
-      Behavior on width { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
-      Behavior on color { ColorAnimation { duration: 240 } }
+      Behavior on width { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
+      Behavior on color { ColorAnimation { duration: Style.duration(240) } }
     }
   }
 
@@ -1514,7 +1514,7 @@ Panel {
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
           font.bold: true
-          Behavior on color { ColorAnimation { duration: 240 } }
+          Behavior on color { ColorAnimation { duration: Style.duration(240) } }
         }
 
         Text {
@@ -1596,9 +1596,9 @@ Panel {
     radius: thickness / 2
     opacity: on ? 1 : 0
 
-    Behavior on opacity { NumberAnimation { duration: 200 } }
-    Behavior on start { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-    Behavior on span { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+    Behavior on opacity { NumberAnimation { duration: Style.duration(200) } }
+    Behavior on start { NumberAnimation { duration: Style.duration(200); easing.type: Easing.OutCubic } }
+    Behavior on span { NumberAnimation { duration: Style.duration(200); easing.type: Easing.OutCubic } }
   }
 
   // Section header with a headline figure on the trailing edge. Reuses
@@ -1661,7 +1661,7 @@ Panel {
       font.pixelSize: Style.font.bodySmall
       font.bold: true
 
-      Behavior on color { ColorAnimation { duration: 240 } }
+      Behavior on color { ColorAnimation { duration: Style.duration(240) } }
     }
   }
 }
