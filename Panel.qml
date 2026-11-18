@@ -969,7 +969,7 @@ Panel {
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
 
-          iconComponent: Text {
+          iconComponent: PlainText {
             text: ""
             color: root.loadColor(root.cpuLoad)
             font.family: root.bar.fontFamily
@@ -977,7 +977,7 @@ Panel {
             Behavior on color { ColorAnimation { duration: Style.duration(240) } }
           }
 
-          trailingControl: Text {
+          trailingControl: PlainText {
             text: root.cpuPercentText
             color: root.loadColor(root.cpuLoad)
             font.family: root.bar.fontFamily
@@ -1167,7 +1167,7 @@ Panel {
                   }
                 }
 
-                Text {
+                PlainText {
                   width: parent.width
                   horizontalAlignment: Text.AlignHCenter
                   text: root.coreLabel(root.coreIds[index])
@@ -1295,7 +1295,7 @@ Panel {
           width: parent.width
           implicitHeight: Math.max(refreshNote.implicitHeight, footerLinks.implicitHeight)
 
-          Text {
+          PlainText {
             id: refreshNote
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
@@ -1378,7 +1378,7 @@ Panel {
       tint: parent.tint
     }
 
-    Text {
+    PlainText {
       anchors.verticalCenter: parent.verticalCenter
       text: parent.label
       color: root.bar.foreground
@@ -1467,7 +1467,7 @@ Panel {
       }
     }
 
-    Text {
+    PlainText {
       anchors.centerIn: parent
       text: gauge.centerText
       color: gauge.asleep ? root.bar.foreground : root.loadColor(gauge.busy)
@@ -1510,7 +1510,7 @@ Panel {
 
       // The label's colour already ties it to its trace in the graph; the
       // dash pattern lives only in the legend.
-      Text {
+      PlainText {
         text: root.accelLabel(cell.deviceId)
         color: root.accelTint(cell.deviceId)
         font.family: root.bar.fontFamily
@@ -1519,7 +1519,7 @@ Panel {
         font.letterSpacing: 1.2
       }
 
-      Text {
+      PlainText {
         width: parent.width
         text: root.accelNames[cell.deviceId] || ""
         visible: text !== ""
@@ -1540,7 +1540,7 @@ Panel {
     property var pair: ["", ""]
     spacing: Style.space(6)
 
-    Text {
+    PlainText {
       width: Style.space(40)
       text: pair[0]
       color: Qt.darker(root.bar.foreground, 1.4)
@@ -1550,7 +1550,7 @@ Panel {
       font.letterSpacing: 1.2
     }
 
-    Text {
+    PlainText {
       text: pair[1]
       color: root.bar.foreground
       font.family: root.bar.fontFamily
@@ -1626,7 +1626,7 @@ Panel {
         width: Math.max(0, parent.width - cellFigure.implicitWidth - Style.space(8))
         spacing: Style.space(5)
 
-        Text {
+        PlainText {
           id: cellCaption
           text: capacityCell.label.toUpperCase()
           color: root.bar.foreground
@@ -1637,7 +1637,7 @@ Panel {
         }
 
         // No letter spacing: that is there to open up capitals.
-        Text {
+        PlainText {
           width: Math.max(0, cellLabel.width - cellCaption.implicitWidth - cellLabel.spacing)
           text: capacityCell.labelDetail
           visible: text !== ""
@@ -1654,7 +1654,7 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
 
-        Text {
+        PlainText {
           text: capacityCell.figureText
           color: root.loadColor(capacityCell.fraction)
           font.family: root.bar.fontFamily
@@ -1663,7 +1663,7 @@ Panel {
           Behavior on color { ColorAnimation { duration: Style.duration(240) } }
         }
 
-        Text {
+        PlainText {
           text: capacityCell.figureSuffix
           color: Qt.darker(root.bar.foreground, 1.4)
           font.family: root.bar.fontFamily
@@ -1682,7 +1682,7 @@ Panel {
     Row {
       width: capacityCell.width
 
-      Text {
+      PlainText {
         id: detailLeadText
         text: capacityCell.detailLead
         color: root.bar.foreground
@@ -1690,7 +1690,7 @@ Panel {
         font.pixelSize: Style.font.caption
       }
 
-      Text {
+      PlainText {
         width: Math.max(0, capacityCell.width - detailLeadText.implicitWidth)
         text: capacityCell.detail
         color: Qt.darker(root.bar.foreground, 1.4)
@@ -1701,7 +1701,7 @@ Panel {
     }
   }
 
-  component FooterLink: Text {
+  component FooterLink: PlainText {
     id: footerLink
 
     signal activated()
@@ -1719,6 +1719,14 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onClicked: footerLink.activated()
     }
+  }
+
+  // Every label here is plain text. Some carry what the plugin does not
+  // write itself (the mount setting, the CPU and GPU names, df and sysfs
+  // figures), and Text's default AutoText would read markup-shaped input
+  // as rich text.
+  component PlainText: Text {
+    textFormat: Text.PlainText
   }
 
   // Zero-height on purpose: Column spacing on either side is the gap.
@@ -1777,7 +1785,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(6)
 
-      Text {
+      PlainText {
         text: parent.parent.note
         visible: text !== ""
         color: root.bar.foreground
@@ -1786,7 +1794,7 @@ Panel {
         font.bold: true
       }
 
-      Text {
+      PlainText {
         text: parent.parent.alert
         visible: text !== ""
         color: root.bar.urgent
@@ -1796,7 +1804,7 @@ Panel {
       }
     }
 
-    Text {
+    PlainText {
       id: headValue
       text: parent.value
       visible: text !== ""
