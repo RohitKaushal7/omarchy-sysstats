@@ -155,6 +155,10 @@ Panel {
   // across whole block devices, ignoring partitions so their I/O is not
   // counted twice alongside the disk they sit on.
   readonly property string diskMount: setting("mount", "/")
+  // Only an absolute path is a mount. Anything else is shown as unavailable
+  // and never reaches df or the disk-usage tools, where "-o…" would be read
+  // as an option.
+  readonly property bool diskMountValid: root.diskMount.charAt(0) === "/"
   property real diskTotalGb: 0
   property real diskUsedGb: 0
   // What df says is free, not total minus used: btrfs and ext4 both keep
@@ -635,6 +639,10 @@ Panel {
   }
 
   function startDiskProbe() {
+    if (!root.diskMountValid) {
+      if (root.diskStatus !== "unavailable") root.clearDisk("unavailable")
+      return
+    }
     if (diskProbe.running) {
       if (Date.now() - root.diskProbeStarted > root.diskStallMs && root.diskStatus !== "stalled")
         root.clearDisk("stalled")
@@ -670,7 +678,7 @@ Panel {
     "read -rsn1 -p 'Press any key to close.'"
 
   function openDiskUsage() {
-    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=TUI.float bash -c "
+    if (root.bar && root.diskMountValid) root.bar.run("omarchy-launch-tui --app-id=TUI.float bash -c "
       + Util.shellQuote(root.diskUsageScript) + " disk-usage " + Util.shellQuote(root.diskMount))
     root.close()
   }

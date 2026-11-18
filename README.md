@@ -133,8 +133,9 @@ omarchy plugin remove dev.reuk.sysstats
 
 That deletes `~/.config/omarchy/plugins/dev.reuk.sysstats/` and drops the widget
 from the bar. Nothing else is left behind: the plugin writes no files, no state
-and no configuration of its own, and it installs no packages or services. If you
-added a layout entry by hand, remove it from `bar.layout` in
+and no configuration of its own, and it installs no services. The only package it
+can install is `dua-cli`, and only if you accept the offer described below. If
+you added a layout entry by hand, remove it from `bar.layout` in
 `~/.config/omarchy/shell.json`.
 
 ## Settings
@@ -163,8 +164,9 @@ They live on the widget's entry in `~/.config/omarchy/shell.json`:
 
 ## What it reads, and what it does not
 
-No privileges, no network, no services, no installers. Nothing is written
-anywhere.
+No network, no services, and nothing is written anywhere. Nothing is installed
+and no privileges are used unless you accept the `dua-cli` offer below, which
+runs `omarchy-pkg-add dua-cli` (pacman, which asks for your password).
 
 Every sample runs one short-lived `sh` that reads `/proc/stat`,
 `/proc/meminfo`, `/proc/loadavg`, `/proc/cpuinfo` and `/proc/diskstats`, and a
