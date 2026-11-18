@@ -1158,7 +1158,8 @@ Panel {
 
             CapacityCell {
               width: capacityRow.cellWidth
-              label: "DISK " + root.diskMount
+              label: "DISK"
+              labelDetail: root.diskMount
               fraction: root.diskFraction
               // Free leads here: on a disk the question is how much room is left.
               figureText: root.diskFreeGb.toFixed(0)
@@ -1489,6 +1490,9 @@ Panel {
     id: capacityCell
 
     property string label: ""
+    // After the label in its own case, not the label's capitals: a mount
+    // path such as /home is case-sensitive.
+    property string labelDetail: ""
     property real fraction: 0
     property real softFraction: 0
     property string figureText: ""
@@ -1502,18 +1506,34 @@ Panel {
       width: capacityCell.width
       height: Math.max(cellLabel.implicitHeight, cellFigure.implicitHeight)
 
-      Text {
+      Row {
         id: cellLabel
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         width: Math.max(0, parent.width - cellFigure.implicitWidth - Style.space(8))
-        text: capacityCell.label.toUpperCase()
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        font.bold: true
-        font.letterSpacing: 1.2
-        elide: Text.ElideRight
+        spacing: Style.space(5)
+
+        Text {
+          id: cellCaption
+          text: capacityCell.label.toUpperCase()
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          font.letterSpacing: 1.2
+        }
+
+        // No letter spacing: that is there to open up capitals.
+        Text {
+          width: Math.max(0, cellLabel.width - cellCaption.implicitWidth - cellLabel.spacing)
+          text: capacityCell.labelDetail
+          visible: text !== ""
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          elide: Text.ElideRight
+        }
       }
 
       Row {
