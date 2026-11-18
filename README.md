@@ -17,7 +17,7 @@ laptops have a GPU and an NPU doing real work, and now you can see it.
 - **One graph for every chip.** CPU as a filled area, GPU dashed and NPU
   dotted on top, in your theme's colours.
 - **A bar icon that tells you when it matters.** CPU and memory meters, plus a
-  thin line above them when the GPU or NPU gets busy.
+  thin line above them when the GPU or NPU gets busy or the disk runs low.
 - **Cheap.** About 14 ms of CPU every two seconds, no root, no daemons, and
   nothing written to disk.
 
@@ -32,8 +32,17 @@ A 2px line appears over the meters while a chip is busy: cyan for the GPU,
 magenta for the NPU, split one segment per meter when both are. Busy means
 above a limit you set ([`gpuAlertAt`, `npuAlertAt`](#settings)). The NPU's
 defaults to any activity at all, since nothing on a desktop uses it by
-accident. The line sits in the bar's spare height, so the meters never move
-when it comes and goes.
+accident.
+
+The same line carries a low-disk mark in the theme's urgent colour while free
+space on the chosen mount is under the smaller of 10 GB and 5% of the disk: 10
+GB on anything over 200 GB, 3.2 GB on a 64 GB eMMC. It stays until free space
+is a tenth over that floor, so a disk on the edge does not blink, and the
+tooltip names the mount while it shows. Marks share the line in the order GPU,
+NPU, disk.
+
+The line sits in the bar's spare height, so the meters never move when it
+comes and goes.
 
 The meters fill along a gamma curve rather than a straight line. Idle machines
 sit in the bottom fifth of the scale, where a 13px track cannot separate 10%
@@ -60,7 +69,10 @@ readout. The panel carries exact numbers.
   split: solid for what apps hold, dim for cache the kernel will hand back on
   demand. The disk side leads with free space, as `df` reports it, so the
   figure already allows for space the filesystem holds back. Swap sits under
-  memory; used of total, and read and write rates, sit under the disk.
+  memory; used of total, and read and write rates, sit under the disk. A mount
+  that does not exist reads *unavailable*, and one that stops answering, such
+  as a hung network share, reads *not responding*, rather than either keeping
+  old figures.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
 Click *Disk usage* to browse what fills the chosen mount in a floating
@@ -155,9 +167,11 @@ No privileges, no network, no services, no installers. Nothing is written
 anywhere.
 
 Every sample runs one short-lived `sh` that reads `/proc/stat`,
-`/proc/meminfo`, `/proc/loadavg`, `/proc/cpuinfo`, `/proc/diskstats` and `df`
-for the chosen mount. GPU and NPU figures come from the same shell, read from
-sysfs with the `read` builtin so they start no extra processes:
+`/proc/meminfo`, `/proc/loadavg`, `/proc/cpuinfo` and `/proc/diskstats`, and a
+second that runs `df` for the chosen mount under a two-second `timeout`, so a
+mount that hangs cannot hold back the other figures. GPU and NPU figures come
+from the first shell, read from sysfs with the `read` builtin so they start no
+extra processes:
 
 - `xe`: `tile*/gt*/gtidle/idle_residency_ms` and `freq0/cur_freq`, `rp0_freq`
 - `i915`: `gt/gt0/rc6_residency_ms`, `gt_cur_freq_mhz`, `gt_RP0_freq_mhz`
