@@ -161,12 +161,14 @@ Panel {
   // space back that neither column counts, so the difference overstates it.
   property real diskFreeGb: 0
   property real diskFraction: 0
-  // "ok" once df has answered for diskMount, "stalled" when it timed out
-  // or is still stuck, as a hung network mount can be. "" until the first
-  // answer. The figures above are zero while stalled.
+  // "ok" once df has answered for diskMount; "unavailable" when it failed
+  // (no such path, no permission), "stalled" when it timed out or is still
+  // stuck, as a hung network mount can be. "" until the first answer.
+  // The figures above are zero whenever this is not "ok".
   property string diskStatus: ""
   readonly property bool diskKnown: diskStatus === "ok"
-  readonly property string diskNote: diskStatus === "stalled" ? "not responding" : ""
+  readonly property string diskNote: diskStatus === "stalled" ? "not responding"
+    : diskStatus === "unavailable" ? "unavailable" : ""
   // When the running probe started, and for which mount.
   property real diskProbeStarted: 0
   property string diskProbeMount: ""
@@ -595,6 +597,9 @@ Panel {
 
   // diskProbe output: "rc <df exit status>", then "disk <size> <used> <avail>".
   function parseDisk(text, mount) {
+    // An answer for a mount the setting has since moved off.
+    if (mount !== root.diskMount) return
+
     var rc = -1
     var d = []
     var lines = String(text).split("\n")
@@ -612,9 +617,9 @@ Panel {
       root.diskFreeGb = freeBytes >= 0 ? bytesToGb(freeBytes) : bytesToGb(totalBytes - usedBytes)
       root.diskFraction = Math.max(0, Math.min(1, usedBytes / totalBytes))
       root.diskStatus = "ok"
-    } else if (rc === 124 || rc === 137) {
-      // timeout's own TERM, and the KILL that follows it.
-      root.clearDisk("stalled")
+    } else {
+      // 124 is timeout's own TERM, 137 the KILL that follows it.
+      root.clearDisk(rc === 124 || rc === 137 ? "stalled" : "unavailable")
     }
   }
 
@@ -627,6 +632,12 @@ Panel {
     root.diskProbeStarted = Date.now()
     root.diskProbeMount = root.diskMount
     diskProbe.running = true
+  }
+
+  // Never show one mount's figures under another's name.
+  onDiskMountChanged: {
+    clearDisk("")
+    startDiskProbe()
   }
 
   function openBtop() {
