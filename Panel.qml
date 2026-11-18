@@ -161,6 +161,18 @@ Panel {
   // space back that neither column counts, so the difference overstates it.
   property real diskFreeGb: 0
   property real diskFraction: 0
+  // "ok" once df has answered for diskMount, "stalled" when it timed out
+  // or is still stuck, as a hung network mount can be. "" until the first
+  // answer. The figures above are zero while stalled.
+  property string diskStatus: ""
+  readonly property bool diskKnown: diskStatus === "ok"
+  readonly property string diskNote: diskStatus === "stalled" ? "not responding" : ""
+  // When the running probe started, and for which mount.
+  property real diskProbeStarted: 0
+  property string diskProbeMount: ""
+  // Past this a probe is reported stuck even if timeout has not ended it:
+  // df's own two seconds, plus the second timeout gives a SIGKILL.
+  readonly property int diskStallMs: 3500
   property real prevUptime: -1
   property real prevSectorsRead: -1
   property real prevSectorsWritten: -1
@@ -496,17 +508,6 @@ Panel {
         root.loadAverage = la.length > 3 ? la[1] + "  " + la[2] + "  " + la[3] : ""
       } else if (line.indexOf("model ") === 0) {
         root.cpuModel = line.substr(6).replace(/^\s+|\s+$/g, "")
-      } else if (line.indexOf("disk ") === 0) {
-        var d = line.split(/\s+/)
-        var totalBytes = parseFloat(d[1])
-        var usedBytes = parseFloat(d[2])
-        var freeBytes = parseFloat(d[3])
-        if (totalBytes > 0 && usedBytes >= 0) {
-          root.diskTotalGb = bytesToGb(totalBytes)
-          root.diskUsedGb = bytesToGb(usedBytes)
-          root.diskFreeGb = freeBytes >= 0 ? bytesToGb(freeBytes) : bytesToGb(totalBytes - usedBytes)
-          root.diskFraction = Math.max(0, Math.min(1, usedBytes / totalBytes))
-        }
       } else if (line.indexOf("dio ") === 0) {
         var io = line.split(/\s+/)
         nextSectorsRead = parseFloat(io[1])
@@ -584,6 +585,50 @@ Panel {
     }
   }
 
+  function clearDisk(status) {
+    root.diskTotalGb = 0
+    root.diskUsedGb = 0
+    root.diskFreeGb = 0
+    root.diskFraction = 0
+    root.diskStatus = status
+  }
+
+  // diskProbe output: "rc <df exit status>", then "disk <size> <used> <avail>".
+  function parseDisk(text, mount) {
+    var rc = -1
+    var d = []
+    var lines = String(text).split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf("rc ") === 0) rc = parseInt(lines[i].substr(3), 10)
+      else if (lines[i].indexOf("disk ") === 0) d = lines[i].split(/\s+/)
+    }
+
+    var totalBytes = parseFloat(d[1])
+    var usedBytes = parseFloat(d[2])
+    var freeBytes = parseFloat(d[3])
+    if (rc === 0 && totalBytes > 0 && usedBytes >= 0) {
+      root.diskTotalGb = bytesToGb(totalBytes)
+      root.diskUsedGb = bytesToGb(usedBytes)
+      root.diskFreeGb = freeBytes >= 0 ? bytesToGb(freeBytes) : bytesToGb(totalBytes - usedBytes)
+      root.diskFraction = Math.max(0, Math.min(1, usedBytes / totalBytes))
+      root.diskStatus = "ok"
+    } else if (rc === 124 || rc === 137) {
+      // timeout's own TERM, and the KILL that follows it.
+      root.clearDisk("stalled")
+    }
+  }
+
+  function startDiskProbe() {
+    if (diskProbe.running) {
+      if (Date.now() - root.diskProbeStarted > root.diskStallMs && root.diskStatus !== "stalled")
+        root.clearDisk("stalled")
+      return
+    }
+    root.diskProbeStarted = Date.now()
+    root.diskProbeMount = root.diskMount
+    diskProbe.running = true
+  }
+
   function openBtop() {
     if (root.bar) root.bar.run("omarchy-launch-or-focus-tui btop")
     root.close()
@@ -622,7 +667,6 @@ Panel {
       "grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo; " +
       "echo \"loadavg $(cat /proc/loadavg)\"; " +
       "echo \"uptime $(cut -d' ' -f1 /proc/uptime)\"; " +
-      "echo \"disk $(df -B1 --output=size,used,avail " + Util.shellQuote(root.diskMount) + " | tail -1)\"; " +
       "awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|mmcblk[0-9]+|vd[a-z]+)$/ {r+=$6; w+=$10} END {print \"dio\", r+0, w+0}' /proc/diskstats; " +
       "echo \"model $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)\"; " +
       "echo \"pcores $(cat /sys/devices/cpu_core/cpus 2>/dev/null)\"; " +
@@ -666,6 +710,23 @@ Panel {
     }
   }
 
+  // df on its own, under a timeout: a hung network mount stalls df, and on
+  // the sampler's shell it would hold back every other figure with it,
+  // since a sample only starts once the last one has finished. The mount
+  // arrives as $1 rather than in the script.
+  Process {
+    id: diskProbe
+    command: ["sh", "-c",
+      "out=$(timeout -k 1 2 df -B1 --output=size,used,avail -- \"$1\" 2>/dev/null); " +
+      "echo \"rc $?\"; echo \"disk $(printf '%s\\n' \"$out\" | tail -n 1)\"",
+      "disk-probe", root.diskProbeMount]
+    stdout: StdioCollector {
+      id: diskCollector
+      waitForEnd: true
+      onStreamFinished: root.parseDisk(diskCollector.text, root.diskProbeMount)
+    }
+  }
+
   // Device names change with hardware, not per tick: probed once, and again
   // only when the set of accelerators does.
   Process {
@@ -705,7 +766,10 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!sampler.running) sampler.running = true
+    onTriggered: {
+      if (!sampler.running) sampler.running = true
+      root.startDiskProbe()
+    }
   }
 
   // ---------- Bar button: two level meters, no text ----------
@@ -1162,13 +1226,16 @@ Panel {
               labelDetail: root.diskMount
               fraction: root.diskFraction
               // Free leads here: on a disk the question is how much room is left.
-              figureText: root.diskFreeGb.toFixed(0)
-              figureSuffix: " GB free"
+              figureText: root.diskKnown ? root.diskFreeGb.toFixed(0) : "—"
+              figureSuffix: root.diskKnown ? " GB free" : ""
               // Used bright, total dim, so the pair reads as used of total
               // without the words; arrows hug their rates to fit the column.
-              detailLead: root.diskUsedGb.toFixed(0)
-              detail: "/" + root.diskTotalGb.toFixed(0)
-                + " · ↓" + root.rateText(root.readBytesPerSec)
+              // Throughput comes from /proc/diskstats, not df, so it carries
+              // on while the mount is unavailable or stuck.
+              detailLead: root.diskKnown ? root.diskUsedGb.toFixed(0) : ""
+              detail: (root.diskKnown ? "/" + root.diskTotalGb.toFixed(0) + " · "
+                  : root.diskNote !== "" ? root.diskNote + " · " : "")
+                + "↓" + root.rateText(root.readBytesPerSec)
                 + " ↑" + root.rateText(root.writeBytesPerSec)
             }
           }
