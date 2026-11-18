@@ -63,10 +63,14 @@ Panel {
   property real cpuLoad: 0
   property var cpuHistory: []
 
-  // Per-core CPU: parallel arrays of previous samples plus current load.
+  // Per-core CPU: previous samples keyed by /proc/stat label, plus current
+  // load in list order. coreIds holds the real CPU number for each entry:
+  // /proc/stat lists online CPUs only, so with nosmt or a CPU taken offline
+  // the position in the list is not the CPU's number.
   property var prevCoreBusy: ({})
   property var prevCoreTotal: ({})
   property var coreLoads: []
+  property var coreIds: []
 
   // Hybrid Intel exposes its two core classes as separate PMUs under
   // /sys/devices/cpu_core and /sys/devices/cpu_atom (Alder Lake and later).
@@ -88,10 +92,12 @@ Panel {
     ? Math.ceil(coreLoads.length / coreRows)
     : 1
 
-  function coreLabel(index) {
-    if (root.pCoreSet[index]) return "P" + index
-    if (root.eCoreSet[index]) return "E" + index
-    return String(index)
+  // Takes the CPU's real number (the N in cpuN), not its grid position.
+  function coreLabel(cpu) {
+    if (cpu === undefined) return ""
+    if (root.pCoreSet[cpu]) return "P" + cpu
+    if (root.eCoreSet[cpu]) return "E" + cpu
+    return String(cpu)
   }
 
   // "0-3", "0-3,8-11" or "2" -> a set of cpu indices.
@@ -439,6 +445,7 @@ Panel {
     var nextCoreBusy = {}
     var nextCoreTotal = {}
     var cores = []
+    var ids = []
 
     var nextUptime = -1
     var nextSectorsRead = -1
@@ -470,6 +477,7 @@ Panel {
             coreLoad = Math.max(0, Math.min(1, (times.busy - prevBusy) / (times.total - prevTotal)))
           }
           cores.push(coreLoad)
+          ids.push(parseInt(label.substr(3), 10))
           nextCoreBusy[label] = times.busy
           nextCoreTotal[label] = times.total
         }
@@ -533,7 +541,12 @@ Panel {
     root.prevCoreTotal = nextCoreTotal
     // Only publish once there is a previous sample to diff against, so the
     // grid does not flash a row of zeroes on the first tick.
-    if (cores.length > 0 && (root.coreLoads.length > 0 || root.prevTotal >= 0)) root.coreLoads = cores
+    if (cores.length > 0 && (root.coreLoads.length > 0 || root.prevTotal >= 0)) {
+      // Only when a CPU goes or comes back, as with accelIds: every
+      // assignment would re-evaluate each label.
+      if (ids.join(" ") !== root.coreIds.join(" ")) root.coreIds = ids
+      root.coreLoads = cores
+    }
 
     if (memTotalKb > 0 && memAvailableKb >= 0) {
       root.memTotalGb = gb(memTotalKb)
@@ -1047,7 +1060,7 @@ Panel {
                 Text {
                   width: parent.width
                   horizontalAlignment: Text.AlignHCenter
-                  text: root.coreLabel(index)
+                  text: root.coreLabel(root.coreIds[index])
                   color: root.bar.foreground
                   opacity: 0.5
                   font.family: root.bar.fontFamily
