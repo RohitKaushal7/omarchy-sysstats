@@ -172,6 +172,15 @@ Panel {
   // When the running probe started, and for which mount.
   property real diskProbeStarted: 0
   property string diskProbeMount: ""
+  // Low disk: a mark on the bar while free space is under the smaller of
+  // 10 GB and 5% of the disk, so a big drive is not flagged with plenty
+  // left and a small one still is. Once on, it holds until free space is
+  // a tenth over the floor, so a disk hovering on the line does not blink.
+  readonly property real diskFloorGb: 10
+  readonly property real diskFloorShare: 0.05
+  readonly property real diskFloorHold: 1.1
+  readonly property real diskFloor: Math.min(diskFloorGb, diskTotalGb * diskFloorShare)
+  property bool diskLow: false
   // Past this a probe is reported stuck even if timeout has not ended it:
   // df's own two seconds, plus the second timeout gives a SIGKILL.
   readonly property int diskStallMs: 3500
@@ -592,6 +601,7 @@ Panel {
     root.diskUsedGb = 0
     root.diskFreeGb = 0
     root.diskFraction = 0
+    root.diskLow = false
     root.diskStatus = status
   }
 
@@ -616,6 +626,7 @@ Panel {
       root.diskUsedGb = bytesToGb(usedBytes)
       root.diskFreeGb = freeBytes >= 0 ? bytesToGb(freeBytes) : bytesToGb(totalBytes - usedBytes)
       root.diskFraction = Math.max(0, Math.min(1, usedBytes / totalBytes))
+      root.diskLow = root.diskFreeGb < root.diskFloor * (root.diskLow ? root.diskFloorHold : 1)
       root.diskStatus = "ok"
     } else {
       // 124 is timeout's own TERM, 137 the KILL that follows it.
@@ -833,6 +844,10 @@ Panel {
           return "   ·   " + root.accelLabel(id) + " " + root.accelPercentText(id)
             + (over ? " (work " + work + "% > " + limit + "%)" : "")
         }).join("")
+      + (root.diskLow
+        ? "   ·   Disk " + root.diskMount + " " + root.diskFreeGb.toFixed(1) + " GB free (under "
+          + (root.diskFloor >= 10 ? root.diskFloor.toFixed(0) : root.diskFloor.toFixed(1)) + " GB)"
+        : "")
     fixedWidth: vertical ? -1 : root.meterWidth * 2 + root.meterGap + Style.space(14)
     fixedHeight: vertical ? root.meterWidth * 2 + root.meterGap + Style.space(14) : -1
     onPressed: root.toggle()
@@ -865,17 +880,28 @@ Panel {
     }
   }
 
-  // GPU mark in the GPU trace colour, NPU mark in the NPU's. One alone
-  // spans the whole meter pair; both split it, GPU first, one segment
-  // over each meter.
+  // GPU mark in the GPU trace colour, NPU mark in the NPU's, low disk in
+  // the theme's urgent colour. One alone spans the whole meter pair; more
+  // split it in that order: two take one segment over each meter, three
+  // close the gaps up so each segment stays wide enough to see. A mark
+  // that is off waits at full length, so it grows in from there.
   component AlertBaseline: Item {
     id: baseline
 
     property bool vertical: false
     property real length: 0
     readonly property real thickness: 2
-    readonly property bool both: root.gpuAlert && root.npuAlert
-    readonly property real half: (length - root.meterGap) / 2
+    readonly property var marks: [root.gpuAlert, root.npuAlert, root.diskLow]
+    readonly property int count: marks.filter(function(on) { return on }).length
+    readonly property real gap: count > 2 ? Style.space(2) : root.meterGap
+    readonly property real slot: count > 1 ? (length - gap * (count - 1)) / count : length
+
+    // Where mark `i` starts, counting only the marks before it that are on.
+    function startOf(i) {
+      var before = 0
+      for (var j = 0; j < i; j++) if (marks[j]) before++
+      return before * (slot + gap)
+    }
 
     width: vertical ? thickness : length
     height: vertical ? length : thickness
@@ -883,19 +909,28 @@ Panel {
     AlertSegment {
       vertical: baseline.vertical
       thickness: baseline.thickness
-      on: root.gpuAlert
+      on: baseline.marks[0]
       color: root.gpuTint
-      start: 0
-      span: baseline.both ? baseline.half : baseline.length
+      start: on ? baseline.startOf(0) : 0
+      span: on ? baseline.slot : baseline.length
     }
 
     AlertSegment {
       vertical: baseline.vertical
       thickness: baseline.thickness
-      on: root.npuAlert
+      on: baseline.marks[1]
       color: root.npuTint
-      start: baseline.both ? baseline.length - baseline.half : 0
-      span: baseline.both ? baseline.half : baseline.length
+      start: on ? baseline.startOf(1) : 0
+      span: on ? baseline.slot : baseline.length
+    }
+
+    AlertSegment {
+      vertical: baseline.vertical
+      thickness: baseline.thickness
+      on: baseline.marks[2]
+      color: root.bar ? root.bar.urgent : Color.urgent
+      start: on ? baseline.startOf(2) : 0
+      span: on ? baseline.slot : baseline.length
     }
   }
 
