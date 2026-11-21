@@ -18,7 +18,7 @@ laptops have a GPU and an NPU doing real work, and now you can see it.
   dotted on top, in your theme's colours.
 - **A bar icon that tells you when it matters.** CPU and memory meters, plus a
   thin line above them when the GPU or NPU gets busy or the disk runs low.
-- **Cheap.** About 14 ms of CPU every two seconds, no root, no daemons, and
+- **Cheap.** About 15 ms of CPU every two seconds, no root, no daemons, and
   nothing written to disk.
 
 ## On the bar
@@ -43,6 +43,12 @@ NPU, disk.
 
 The line sits in the bar's spare height, so the meters never move when it
 comes and goes.
+
+If the figures stop arriving, the bar stops showing them rather than freezing
+on the last ones. After three intervals with no fresh CPU and memory reading,
+both meters empty to their bare tracks and the tooltip says *CPU and memory not
+responding*; after three with no fresh GPU and NPU reading, their marks leave
+the line.
 
 The meters fill along a gamma curve rather than a straight line. Idle machines
 sit in the bottom fifth of the scale, where a 13px track cannot separate 10%
@@ -73,6 +79,14 @@ readout. The panel carries exact numbers.
   that does not exist reads *unavailable*, and one that stops answering, such
   as a hung network share, reads *not responding*, rather than either keeping
   old figures.
+
+The same goes for every figure that stops arriving: three intervals without a
+fresh one and it reads as *not responding* or an em dash, never as the last
+number it had. CPU, memory, load and disk rates go together, and GPU, NPU, CPU
+temperature and throttling together. Free space keeps its own check: *not
+responding* once `df` has had 3.5 seconds without answering. When readings
+come back, the first one only sets the base the next is measured against, so
+a stall never ends in a false spike.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
 Click *Disk usage* to browse what fills the chosen mount in a floating
@@ -168,12 +182,27 @@ No network, no services, and nothing is written anywhere. Nothing is installed
 and no privileges are used unless you accept the `dua-cli` offer below, which
 runs `omarchy-pkg-add dua-cli` (pacman, which asks for your password).
 
-Every sample runs one short-lived `sh` that reads `/proc/stat`,
-`/proc/meminfo`, `/proc/loadavg`, `/proc/cpuinfo` and `/proc/diskstats`, and a
-second that runs `df` for the chosen mount under a two-second `timeout`, so a
-mount that hangs cannot hold back the other figures. GPU and NPU figures come
-from the first shell, read from sysfs with the `read` builtin so they start no
-extra processes:
+Every sample runs three short-lived `sh` processes, each on its own so that
+one that hangs cannot hold back the others:
+
+- The sampler reads `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`,
+  `/proc/cpuinfo` and `/proc/diskstats`: CPU, memory, load and disk rates.
+- The device probe reads GPU, NPU and CPU sensor files from sysfs with the
+  `read` builtin, so it starts nothing further. These go through drivers, and
+  a driver read that stalls stops only these figures.
+- The disk probe runs `df` for the chosen mount under a two-second `timeout`.
+  A `df` stuck in uninterruptible I/O, as on a hung network mount, outlives
+  even that, so each probe is its own process and holds up only its own mount:
+  choosing another mount reads it straight away. A stuck mount is not asked
+  again until its probe returns, and no more than four probes are ever
+  waiting at once.
+
+While a sampler or device probe is still running, the next one is skipped, and
+three intervals without a fresh result mark its figures as not responding (see
+[In the panel](#in-the-panel)). A result that arrives after that is thrown
+away, since what it read may be long out of date.
+
+The device probe reads:
 
 - `xe`: `tile*/gt*/gtidle/idle_residency_ms` and `freq0/cur_freq`, `rp0_freq`
 - `i915`: `gt/gt0/rc6_residency_ms`, `gt_cur_freq_mhz`, `gt_RP0_freq_mhz`
@@ -191,7 +220,7 @@ install. `lspci`, from `pciutils`, runs once at startup to name the devices.
 [`dua`](https://github.com/Byron/dua-cli), or `gdu` or `ncdu` if one of those
 is what you have, and offers to install `dua-cli` if none is.
 
-A whole sample costs about 14 ms of CPU, the GPU and NPU reads about 1 ms of
+A whole sample costs about 15 ms of CPU, the device probe about 2 ms of
 that. `/proc` is read through a subprocess rather than a `FileView` because
 procfs reports `st_size` 0, which size-based readers mishandle. Deltas are
 computed in QML, so no sampling sleep is needed, and rates divide by the change
