@@ -18,11 +18,14 @@
 // reports st_size 0, which size-based readers mishandle. CPU deltas are kept
 // here in QML so no sampling sleep is needed.
 //
-// GPUs and NPUs ride on the same `sh`, read with the `read` builtin so they
-// add no processes. GPU load is the share of the tick the GT spent out of
-// RC6 (xe gtidle, i915 rc6_residency) — "awake", which tracks real load
-// closely without the CAP_PERFMON the engine PMU needs or the /proc/*/fdinfo
-// walk per-client accounting costs. amdgpu reports gpu_busy_percent directly.
+// GPUs, NPUs and the CPU's temperature sensors are read by a second `sh`
+// of their own (deviceProbe), with the `read` builtin so it starts nothing
+// further. These are driver reads rather than kernel bookkeeping, and one
+// that stalls must not hold back the CPU and memory figures. GPU load is
+// the share of the tick the GT spent out of RC6 (xe gtidle, i915
+// rc6_residency) — "awake", which tracks real load closely without the
+// CAP_PERFMON the engine PMU needs or the /proc/*/fdinfo walk per-client
+// accounting costs. amdgpu reports gpu_busy_percent directly.
 // A runtime-suspended device is never read: on a dGPU that read would wake
 // it out of D3 and cost more power than the widget is worth.
 
@@ -213,6 +216,8 @@ Panel {
   property var accelHistory: ({})
   property var accelNames: ({})
   property var prevAccel: ({})
+  // deviceProbe's own clock, for its deltas: it runs apart from the sampler.
+  property real prevDeviceUptime: -1
 
   // Trace and gauge colours come from the theme's ANSI cyan/magenta/blue so
   // they follow theme switches; these are the fallbacks for themes without.
@@ -485,8 +490,6 @@ Panel {
     var nextUptime = -1
     var nextSectorsRead = -1
     var nextSectorsWritten = -1
-    var accelRecords = []
-    var throttleMs = -1
 
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i]
@@ -549,17 +552,8 @@ Panel {
           root.eCoreSpec = espec
           root.eCoreSet = root.parseCpuList(espec)
         }
-      } else if (line.indexOf("gpu ") === 0 || line.indexOf("npu ") === 0) {
-        accelRecords.push(line.split(/\s+/))
-      } else if (line.indexOf("ctemp ") === 0) {
-        var milli = parseFloat(line.substr(6))
-        if (!isNaN(milli)) root.cpuTempC = milli / 1000
-      } else if (line.indexOf("throttle ") === 0) {
-        throttleMs = parseFloat(line.substr(9))
       }
     }
-
-    if (nextUptime >= 0 && throttleMs >= 0) root.updateThrottle(nextUptime, throttleMs)
 
     root.prevCoreBusy = nextCoreBusy
     root.prevCoreTotal = nextCoreTotal
@@ -588,10 +582,6 @@ Panel {
       root.swapUsedGb = gb(swapTotalKb - swapFreeKb)
     }
 
-    // Before the storage block below moves prevUptime on.
-    var tickSeconds = nextUptime >= 0 && root.prevUptime >= 0 ? nextUptime - root.prevUptime : -1
-    root.updateAccelerators(accelRecords, tickSeconds)
-
     // Throughput comes from /proc/uptime rather than the timer interval, so
     // a late or coalesced tick reports the rate over the time that actually
     // elapsed instead of the time that was scheduled.
@@ -606,6 +596,35 @@ Panel {
       root.prevSectorsRead = nextSectorsRead
       root.prevSectorsWritten = nextSectorsWritten
     }
+  }
+
+  // deviceProbe output: "uptime", then gpu/npu records and the CPU sensors.
+  function parseDevices(text) {
+    var lines = String(text).split("\n")
+    var uptime = -1
+    var records = []
+    var throttleMs = -1
+    var tempC = -1
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i]
+      if (line.indexOf("gpu ") === 0 || line.indexOf("npu ") === 0) {
+        records.push(line.split(/\s+/))
+      } else if (line.indexOf("uptime ") === 0) {
+        uptime = parseFloat(line.substr(7))
+      } else if (line.indexOf("ctemp ") === 0) {
+        var milli = parseFloat(line.substr(6))
+        if (!isNaN(milli)) tempC = milli / 1000
+      } else if (line.indexOf("throttle ") === 0) {
+        throttleMs = parseFloat(line.substr(9))
+      }
+    }
+
+    if (tempC >= 0) root.cpuTempC = tempC
+    if (uptime >= 0 && throttleMs >= 0) root.updateThrottle(uptime, throttleMs)
+    var elapsed = uptime >= 0 && root.prevDeviceUptime >= 0 ? uptime - root.prevDeviceUptime : -1
+    root.updateAccelerators(records, elapsed)
+    if (uptime >= 0) root.prevDeviceUptime = uptime
   }
 
   function clearDisk(status) {
@@ -734,7 +753,24 @@ Panel {
       "awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|mmcblk[0-9]+|vd[a-z]+)$/ {r+=$6; w+=$10} END {print \"dio\", r+0, w+0}' /proc/diskstats; " +
       "echo \"model $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)\"; " +
       "echo \"pcores $(cat /sys/devices/cpu_core/cpus 2>/dev/null)\"; " +
-      "echo \"ecores $(cat /sys/devices/cpu_atom/cpus 2>/dev/null)\"; " +
+      "echo \"ecores $(cat /sys/devices/cpu_atom/cpus 2>/dev/null)\""]
+    stdout: StdioCollector {
+      id: collector
+      waitForEnd: true
+      // Referenced through the id on purpose: a bare `text` here would
+      // resolve to whatever `text` is in scope, not the collector's own.
+      onStreamFinished: root.parse(collector.text)
+    }
+  }
+
+  // GPU, NPU and CPU sensor reads, apart from the sampler: they go through
+  // drivers, and a read that stalls there would otherwise stop the CPU and
+  // memory figures with it. Builtins only, so one process per sample; it
+  // reads /proc/uptime itself so its deltas use its own clock.
+  Process {
+    id: deviceProbe
+    command: ["sh", "-c",
+      "read up _ < /proc/uptime; echo \"uptime $up\"; " +
       // card0-DP-1 and friends are connectors, not devices.
       "for c in /sys/class/drm/card[0-9]*; do " +
         "case ${c##*/} in *-*) continue;; esac; d=$c/device; [ -e \"$d\" ] || continue; " +
@@ -766,11 +802,9 @@ Panel {
       "read t < /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms 2>/dev/null " +
         "&& echo \"throttle $t\""]
     stdout: StdioCollector {
-      id: collector
+      id: deviceCollector
       waitForEnd: true
-      // Referenced through the id on purpose: a bare `text` here would
-      // resolve to whatever `text` is in scope, not the collector's own.
-      onStreamFinished: root.parse(collector.text)
+      onStreamFinished: root.parseDevices(deviceCollector.text)
     }
   }
 
@@ -841,6 +875,7 @@ Panel {
     triggeredOnStart: true
     onTriggered: {
       if (!sampler.running) sampler.running = true
+      if (!deviceProbe.running) deviceProbe.running = true
       root.startDiskProbe()
     }
   }
