@@ -173,9 +173,17 @@ Panel {
   readonly property bool diskKnown: diskStatus === "ok"
   readonly property string diskNote: diskStatus === "stalled" ? "not responding"
     : diskStatus === "unavailable" ? "unavailable" : ""
-  // When the running probe started, and for which mount.
-  property real diskProbeStarted: 0
-  property string diskProbeMount: ""
+  // Probes in flight, each its own process tagged with its mount (see
+  // diskProbeComponent). A df stuck in uninterruptible I/O cannot be ended,
+  // not even by timeout's KILL, so it must not stand in the way of the next
+  // mount: choosing another starts a probe for it at once. Only one is in
+  // flight per mount, so a mount that stays stuck reads "stalled" rather
+  // than gathering a new df every tick, and only diskProbeCap at all, so
+  // flipping between hung mounts cannot pile processes up.
+  property var diskProbes: []
+  readonly property int diskProbeCap: 4
+  // When diskMount was last chosen.
+  property real diskMountSince: 0
   // Low disk: a mark on the bar while free space is under the smaller of
   // 10 GB and 5% of the disk, so a big drive is not flagged with plenty
   // left and a small one still is. Once on, it holds until free space is
@@ -609,7 +617,9 @@ Panel {
     root.diskStatus = status
   }
 
-  // diskProbe output: "rc <df exit status>", then "disk <size> <used> <avail>".
+  // Probe output: "rc <df exit status>", then "disk <size> <used> <avail>".
+  // With one probe per mount in flight, an answer for the current mount is
+  // also the newest for it: the next is only started once this one is gone.
   function parseDisk(text, mount) {
     // An answer for a mount the setting has since moved off.
     if (mount !== root.diskMount) return
@@ -643,19 +653,43 @@ Panel {
       if (root.diskStatus !== "unavailable") root.clearDisk("unavailable")
       return
     }
-    if (diskProbe.running) {
-      if (Date.now() - root.diskProbeStarted > root.diskStallMs && root.diskStatus !== "stalled")
+    var mount = root.diskMount
+    var pending = null
+    for (var i = 0; i < root.diskProbes.length; i++) {
+      if (root.diskProbes[i].mount === mount) pending = root.diskProbes[i]
+    }
+    // Still waiting on this mount: no second df, and past diskStallMs the
+    // mount is reported stuck.
+    if (pending) {
+      if (Date.now() - pending.started > root.diskStallMs && root.diskStatus !== "stalled")
         root.clearDisk("stalled")
       return
     }
-    root.diskProbeStarted = Date.now()
-    root.diskProbeMount = root.diskMount
-    diskProbe.running = true
+    // Every slot is held by probes stuck on other mounts. Nothing can be
+    // asked until one of them ends; after as long as a stuck probe is
+    // given, say this mount is not answering either.
+    if (root.diskProbes.length >= root.diskProbeCap) {
+      if (Date.now() - root.diskMountSince > root.diskStallMs && root.diskStatus !== "stalled")
+        root.clearDisk("stalled")
+      return
+    }
+    var probe = diskProbeComponent.createObject(root, { mount: mount, started: Date.now() })
+    if (!probe) return
+    root.diskProbes = root.diskProbes.concat([probe])
+    probe.running = true
+  }
+
+  // Only once the process has gone: destroying a Process that is still
+  // running would kill and then wait on it.
+  function diskProbeEnded(probe) {
+    root.diskProbes = root.diskProbes.filter(function(p) { return p !== probe })
+    probe.destroy()
   }
 
   // Never show one mount's figures under another's name.
   onDiskMountChanged: {
     clearDisk("")
+    diskMountSince = Date.now()
     startDiskProbe()
   }
 
@@ -742,18 +776,27 @@ Panel {
 
   // df on its own, under a timeout: a hung network mount stalls df, and on
   // the sampler's shell it would hold back every other figure with it,
-  // since a sample only starts once the last one has finished. The mount
+  // since a sample only starts once the last one has finished. One process
+  // per probe, made by startDiskProbe and destroyed once it exits, so a df
+  // that even timeout cannot end holds up only its own mount. The mount
   // arrives as $1 rather than in the script.
-  Process {
-    id: diskProbe
-    command: ["sh", "-c",
-      "out=$(timeout -k 1 2 df -B1 --output=size,used,avail -- \"$1\" 2>/dev/null); " +
-      "echo \"rc $?\"; echo \"disk $(printf '%s\\n' \"$out\" | tail -n 1)\"",
-      "disk-probe", root.diskProbeMount]
-    stdout: StdioCollector {
-      id: diskCollector
-      waitForEnd: true
-      onStreamFinished: root.parseDisk(diskCollector.text, root.diskProbeMount)
+  Component {
+    id: diskProbeComponent
+
+    Process {
+      id: probe
+      property string mount: ""
+      property real started: 0
+      command: ["sh", "-c",
+        "out=$(timeout -k 1 2 df -B1 --output=size,used,avail -- \"$1\" 2>/dev/null); " +
+        "echo \"rc $?\"; echo \"disk $(printf '%s\\n' \"$out\" | tail -n 1)\"",
+        "disk-probe", probe.mount]
+      stdout: StdioCollector {
+        id: probeOutput
+        waitForEnd: true
+        onStreamFinished: root.parseDisk(probeOutput.text, probe.mount)
+      }
+      onExited: root.diskProbeEnded(probe)
     }
   }
 
