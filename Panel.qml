@@ -784,8 +784,9 @@ Panel {
   }
 
   // Only once the process has gone: destroying a Process that is still
-  // running would kill and then wait on it.
+  // running would kill and then wait on it. Safe to call twice.
   function diskProbeEnded(probe) {
+    if (root.diskProbes.indexOf(probe) < 0) return
     root.diskProbes = root.diskProbes.filter(function(p) { return p !== probe })
     probe.destroy()
   }
@@ -917,7 +918,11 @@ Panel {
         waitForEnd: true
         onStreamFinished: root.parseDisk(probeOutput.text, probe.mount)
       }
-      onExited: root.diskProbeEnded(probe)
+      // On running going false rather than on exited: a launch that fails
+      // (no fork, sh not found) never emits exited, and would otherwise
+      // hold its mount's slot for good. On a normal exit this comes after
+      // the output has been parsed.
+      onRunningChanged: if (!running) root.diskProbeEnded(probe)
     }
   }
 
