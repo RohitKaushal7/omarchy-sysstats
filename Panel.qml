@@ -49,8 +49,32 @@ Panel {
   // any NPU work at all is worth a mark.
   readonly property real gpuAlertAt: Math.max(0, Math.min(100, setting("gpuAlertAt", 50)))
   readonly property real npuAlertAt: Math.max(0, Math.min(100, setting("npuAlertAt", 0)))
-  property bool gpuAlert: false
-  property bool npuAlert: false
+  // Over the limit as last read; the marks themselves also need that
+  // reading to be fresh.
+  property bool gpuOver: false
+  property bool npuOver: false
+  readonly property bool gpuAlert: gpuOver && !deviceStale
+  readonly property bool npuAlert: npuOver && !deviceStale
+
+  // Expiry. Each process's figures count as fresh while it keeps bringing
+  // samples; once staleTicks ticks pass without one (a read stuck in a
+  // driver, say), they are shown as not responding: an em dash in the
+  // panel, empty meters and no GPU or NPU marks on the bar, rather than the
+  // last numbers frozen in place. Counted in ticks, not wall time, so a
+  // resume from suspend does not read as a stall.
+  readonly property int staleTicks: 3
+  property int coreAge: 0
+  property int deviceAge: 0
+  readonly property bool coreStale: coreAge >= staleTicks
+  readonly property bool deviceStale: deviceAge >= staleTicks
+  // Bumped as a group goes stale. A sample started before then is thrown
+  // away when it finally returns: what it read may be minutes old, and it
+  // would make a bogus delta against the next. The first sample after it
+  // only sets the base the next one is diffed against.
+  property int coreEpoch: 0
+  property int coreRunEpoch: 0
+  property int deviceEpoch: 0
+  property int deviceRunEpoch: 0
   readonly property int historyLength: 48
 
   readonly property color ink: bar ? bar.foreground : Color.foreground
@@ -150,8 +174,8 @@ Panel {
   readonly property real throttleFloor: 0.01
   property var throttleSamples: []
   property real throttleShare: 0
-  readonly property string cpuTempText: cpuTempC >= 0 ? Math.round(cpuTempC) + "°C" : ""
-  readonly property string throttleText: throttleShare >= throttleFloor
+  readonly property string cpuTempText: cpuTempC >= 0 && !deviceStale ? Math.round(cpuTempC) + "°C" : ""
+  readonly property string throttleText: throttleShare >= throttleFloor && !deviceStale
     ? "· throttled " + Math.round(throttleShare * 100) + "%" : ""
 
   // Storage. Usage is for one mount (configurable); throughput is summed
@@ -205,7 +229,10 @@ Panel {
   property real readBytesPerSec: 0
   property real writeBytesPerSec: 0
 
-  readonly property string cpuPercentText: Math.round(cpuLoad * 100) + "%"
+  readonly property string cpuPercentText: coreStale ? "—" : Math.round(cpuLoad * 100) + "%"
+  // CPU and memory as far as colour and fill go: nothing while stale.
+  readonly property real cpuShown: coreStale ? 0 : cpuLoad
+  readonly property real memShown: coreStale ? 0 : memFraction
 
   // Accelerators, keyed by sysfs node (card0, accel0). accelIds only
   // changes when a device appears or goes, so the Repeaters keep their
@@ -242,7 +269,7 @@ Panel {
 
   function accelPercentText(id) {
     var s = root.accelState[id]
-    if (!s || s.asleep || s.busy < 0) return "—"
+    if (!s || root.deviceStale || s.asleep || s.busy < 0) return "—"
     return Math.round(s.busy * 100) + "%"
   }
 
@@ -250,6 +277,9 @@ Panel {
   function accelFacts(id) {
     var s = root.accelState[id]
     if (!s) return []
+    if (root.deviceStale) return s.kind === "npu"
+      ? [["CLOCK", "—"], ["MEM", "—"]]
+      : [["MEDIA", "—"], ["CLOCK", "—"]]
     var clock = s.clockMhz > 0 ? Math.round(s.clockMhz) + " MHz" : "—"
     if (s.kind === "npu") {
       return [
@@ -292,7 +322,7 @@ Panel {
       var id = r[1]
       var s = state[id]
       if (!s) {
-        s = state[id] = { kind: r[0], asleep: false, busy: -1, media: -1, clock: -1, clockMhz: 0, memBytes: -1 }
+        s = state[id] = { kind: r[0], stale: root.deviceStale, asleep: false, busy: -1, media: -1, clock: -1, clockMhz: 0, memBytes: -1 }
         ids.push(id)
       }
 
@@ -347,8 +377,8 @@ Panel {
     root.accelHistory = history
     if (ids.join(" ") !== root.accelIds.join(" ")) root.accelIds = ids
 
-    root.gpuAlert = root.overLimit(ids, state, "gpu", root.gpuAlertAt)
-    root.npuAlert = root.overLimit(ids, state, "npu", root.npuAlertAt)
+    root.gpuOver = root.overLimit(ids, state, "gpu", root.gpuAlertAt)
+    root.npuOver = root.overLimit(ids, state, "npu", root.npuAlertAt)
   }
 
   // True while any device of `kind` works above `limit` percent.
@@ -475,7 +505,10 @@ Panel {
   }
 
   function parse(text) {
+    if (root.coreRunEpoch !== root.coreEpoch) return
     var lines = String(text).split("\n")
+    var cpuFresh = false
+    var memFresh = false
     var memTotalKb = -1
     var memAvailableKb = -1
     var memFreeKb = -1
@@ -504,6 +537,7 @@ Panel {
             var load = (times.busy - root.prevBusy) / (times.total - root.prevTotal)
             root.cpuLoad = Math.max(0, Math.min(1, load))
             root.pushHistory(root.cpuLoad)
+            cpuFresh = true
           }
           root.prevBusy = times.busy
           root.prevTotal = times.total
@@ -558,8 +592,8 @@ Panel {
     root.prevCoreBusy = nextCoreBusy
     root.prevCoreTotal = nextCoreTotal
     // Only publish once there is a previous sample to diff against, so the
-    // grid does not flash a row of zeroes on the first tick.
-    if (cores.length > 0 && (root.coreLoads.length > 0 || root.prevTotal >= 0)) {
+    // grid does not flash a row of zeroes on the first tick or after a stall.
+    if (cores.length > 0 && cpuFresh) {
       // Only when a CPU goes or comes back, as with accelIds: every
       // assignment would re-evaluate each label.
       if (ids.join(" ") !== root.coreIds.join(" ")) root.coreIds = ids
@@ -576,6 +610,7 @@ Panel {
       }
       root.memUsedGb = gb(memTotalKb - memAvailableKb)
       root.memFraction = Math.max(0, Math.min(1, (memTotalKb - memAvailableKb) / memTotalKb))
+      memFresh = true
     }
     if (swapTotalKb >= 0 && swapFreeKb >= 0) {
       root.swapTotalGb = gb(swapTotalKb)
@@ -596,11 +631,15 @@ Panel {
       root.prevSectorsRead = nextSectorsRead
       root.prevSectorsWritten = nextSectorsWritten
     }
+
+    if (cpuFresh && memFresh) root.coreAge = 0
   }
 
   // deviceProbe output: "uptime", then gpu/npu records and the CPU sensors.
   function parseDevices(text) {
+    if (root.deviceRunEpoch !== root.deviceEpoch) return
     var lines = String(text).split("\n")
+    var complete = false
     var uptime = -1
     var records = []
     var throttleMs = -1
@@ -617,14 +656,60 @@ Panel {
         if (!isNaN(milli)) tempC = milli / 1000
       } else if (line.indexOf("throttle ") === 0) {
         throttleMs = parseFloat(line.substr(9))
+      } else if (line === "end") {
+        complete = true
       }
     }
 
     if (tempC >= 0) root.cpuTempC = tempC
     if (uptime >= 0 && throttleMs >= 0) root.updateThrottle(uptime, throttleMs)
     var elapsed = uptime >= 0 && root.prevDeviceUptime >= 0 ? uptime - root.prevDeviceUptime : -1
+    // A gap this long (a resume from suspend) is diffed afresh rather than
+    // averaged over: the counters do not all run while the machine sleeps.
+    if (elapsed > root.staleTicks * root.refreshMs / 1000) elapsed = -1
+    // Before the update, which stamps each device with deviceStale.
+    if (complete && elapsed > 0) root.deviceAge = 0
     root.updateAccelerators(records, elapsed)
     if (uptime >= 0) root.prevDeviceUptime = uptime
+  }
+
+  // Forget the previous samples, so the next delta starts from a fresh base.
+  function rebaseCore() {
+    root.coreEpoch++
+    root.prevBusy = -1
+    root.prevTotal = -1
+    root.prevCoreBusy = ({})
+    root.prevCoreTotal = ({})
+    root.prevUptime = -1
+    // The core grid empties rather than holding the last loads.
+    root.coreLoads = root.coreLoads.map(function() { return -1 })
+  }
+
+  function rebaseDevices() {
+    root.deviceEpoch++
+    // Marked on each device as well: the cells read only their own state.
+    var marked = {}
+    for (var id in root.accelState) marked[id] = Object.assign({}, root.accelState[id], { stale: true })
+    root.accelState = marked
+    root.prevAccel = ({})
+    root.prevDeviceUptime = -1
+    root.throttleSamples = []
+    root.throttleShare = 0
+  }
+
+  onCoreStaleChanged: if (coreStale) rebaseCore()
+  onDeviceStaleChanged: if (deviceStale) rebaseDevices()
+
+  function startSampler() {
+    if (sampler.running) return
+    root.coreRunEpoch = root.coreEpoch
+    sampler.running = true
+  }
+
+  function startDeviceProbe() {
+    if (deviceProbe.running) return
+    root.deviceRunEpoch = root.deviceEpoch
+    deviceProbe.running = true
   }
 
   function clearDisk(status) {
@@ -741,7 +826,7 @@ Panel {
 
   onCpuHistoryChanged: sparkline.requestPaint()
   onInkChanged: sparkline.requestPaint()
-  onOpenedChanged: if (opened) { sampler.running = true; sparkline.requestPaint() }
+  onOpenedChanged: if (opened) { startSampler(); sparkline.requestPaint() }
 
   Process {
     id: sampler
@@ -800,7 +885,9 @@ Panel {
       "done 2>/dev/null; " +
       // Intel only; elsewhere the line is simply absent.
       "read t < /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms 2>/dev/null " +
-        "&& echo \"throttle $t\""]
+        "&& echo \"throttle $t\"; " +
+      // Only a run that got this far counts as a sample.
+      "echo end"]
     stdout: StdioCollector {
       id: deviceCollector
       waitForEnd: true
@@ -874,8 +961,12 @@ Panel {
     repeat: true
     triggeredOnStart: true
     onTriggered: {
-      if (!sampler.running) sampler.running = true
-      if (!deviceProbe.running) deviceProbe.running = true
+      // A process still running from an earlier tick is left to finish
+      // and its group ages; see staleTicks.
+      root.coreAge = Math.min(root.staleTicks, root.coreAge + 1)
+      root.deviceAge = Math.min(root.staleTicks, root.deviceAge + 1)
+      root.startSampler()
+      root.startDeviceProbe()
       root.startDiskProbe()
     }
   }
@@ -889,6 +980,9 @@ Panel {
   component Meter: Item {
     property real fraction: 0
     property int settleMs: 240
+    // No fresh sample: the fill goes, leaving the bare track, rather than
+    // holding a reading that may no longer be true.
+    property bool stale: false
 
     readonly property real shown: Math.pow(Math.max(0, Math.min(1, fraction)), 0.6)
 
@@ -910,7 +1004,9 @@ Panel {
       height: Math.max(2, parent.height * parent.shown)
       radius: width / 2
       color: root.loadColor(parent.fraction)
+      opacity: parent.stale ? 0 : 1
 
+      Behavior on opacity { NumberAnimation { duration: Style.duration(200) } }
       Behavior on height { NumberAnimation { duration: Style.duration(settleMs); easing.type: Easing.OutCubic } }
       Behavior on color { ColorAnimation { duration: Style.duration(240) } }
     }
@@ -921,7 +1017,8 @@ Panel {
     bar: root.bar
     labelVisible: false
     hasVisualContent: true
-    tooltipText: "CPU " + root.cpuPercentText + "   ·   RAM " + root.memUsedGb.toFixed(1) + " / " + root.memTotalGb.toFixed(1) + " GB"
+    tooltipText: (root.coreStale ? "CPU and memory not responding"
+        : "CPU " + root.cpuPercentText + "   ·   RAM " + root.memUsedGb.toFixed(1) + " / " + root.memTotalGb.toFixed(1) + " GB")
       + root.accelIds.map(function(id) {
           var kind = root.accelKind(id)
           var over = kind === "gpu" ? root.gpuAlert : root.npuAlert
@@ -946,8 +1043,8 @@ Panel {
       columnSpacing: root.meterGap
       rowSpacing: root.meterGap
 
-      Meter { fraction: root.cpuLoad; settleMs: 180 }
-      Meter { fraction: root.memFraction; settleMs: 320 }
+      Meter { fraction: root.cpuShown; stale: root.coreStale; settleMs: 180 }
+      Meter { fraction: root.memShown; stale: root.coreStale; settleMs: 320 }
     }
 
     // Alert line over the meters (to their left on a vertical bar),
@@ -1057,7 +1154,7 @@ Panel {
 
           iconComponent: PlainText {
             text: ""
-            color: root.loadColor(root.cpuLoad)
+            color: root.loadColor(root.cpuShown)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.display
             Behavior on color { ColorAnimation { duration: Style.duration(240) } }
@@ -1065,7 +1162,7 @@ Panel {
 
           trailingControl: PlainText {
             text: root.cpuPercentText
-            color: root.loadColor(root.cpuLoad)
+            color: root.loadColor(root.cpuShown)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.displayLarge
             font.bold: true
@@ -1170,7 +1267,7 @@ Panel {
             spacing: Style.space(16)
             visible: root.accelIds.length > 0
 
-            LegendItem { kind: "cpu"; tint: root.loadColor(root.cpuLoad); label: "CPU " + root.cpuPercentText }
+            LegendItem { kind: "cpu"; tint: root.loadColor(root.cpuShown); label: "CPU " + root.cpuPercentText }
 
             Repeater {
               model: root.accelIds
@@ -1200,7 +1297,8 @@ Panel {
             title: "CORES"
             note: root.cpuTempText
             alert: root.throttleText
-            value: root.loadAverage !== "" ? "LOAD  " + root.loadAverage : ""
+            value: root.coreStale ? "not responding"
+              : root.loadAverage !== "" ? "LOAD  " + root.loadAverage : ""
           }
 
           Grid {
@@ -1223,6 +1321,7 @@ Panel {
               model: root.coreLoads
 
               Column {
+                id: coreCell
                 required property var modelData
                 required property int index
                 width: coreGrid.cellWidth
@@ -1244,7 +1343,8 @@ Panel {
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
-                    height: Math.max(2, parent.height * Math.max(0, Math.min(1, modelData)))
+                    // -1 is no reading (see rebaseCore): an empty block.
+                    height: Math.max(coreCell.modelData < 0 ? 0 : 2, parent.height * Math.min(1, coreCell.modelData))
                     radius: Style.cornerRadius
                     color: root.loadColor(modelData)
 
@@ -1278,7 +1378,10 @@ Panel {
           spacing: Style.space(10)
           visible: root.accelIds.length > 0
 
-          SectionHead { title: "ACCELERATORS" }
+          SectionHead {
+            title: "ACCELERATORS"
+            value: root.deviceStale ? "not responding" : ""
+          }
 
           Row {
             id: accelRow
@@ -1338,12 +1441,13 @@ Panel {
             CapacityCell {
               width: capacityRow.cellWidth
               label: "RAM"
-              fraction: root.memFraction
-              softFraction: root.memCacheFraction
-              figureText: root.memUsedGb.toFixed(1)
-              figureSuffix: " / " + root.memTotalGb.toFixed(1) + " GB"
-              detail: "cache " + root.memCacheGb.toFixed(1) + " · "
-                + (root.swapTotalGb > 0 ? "swap " + root.swapUsedGb.toFixed(1) : "no swap")
+              fraction: root.memShown
+              softFraction: root.coreStale ? 0 : root.memCacheFraction
+              figureText: root.coreStale ? "—" : root.memUsedGb.toFixed(1)
+              figureSuffix: root.coreStale ? "" : " / " + root.memTotalGb.toFixed(1) + " GB"
+              detail: root.coreStale ? "not responding"
+                : "cache " + root.memCacheGb.toFixed(1) + " · "
+                  + (root.swapTotalGb > 0 ? "swap " + root.swapUsedGb.toFixed(1) : "no swap")
             }
 
             Rectangle {
@@ -1363,12 +1467,14 @@ Panel {
               // Used bright, total dim, so the pair reads as used of total
               // without the words; arrows hug their rates to fit the column.
               // Throughput comes from /proc/diskstats, not df, so it carries
-              // on while the mount is unavailable or stuck.
+              // on while the mount is unavailable or stuck, and goes with the
+              // CPU and memory figures when the sampler stalls instead.
               detailLead: root.diskKnown ? root.diskUsedGb.toFixed(0) : ""
-              detail: (root.diskKnown ? "/" + root.diskTotalGb.toFixed(0) + " · "
-                  : root.diskNote !== "" ? root.diskNote + " · " : "")
-                + "↓" + root.rateText(root.readBytesPerSec)
-                + " ↑" + root.rateText(root.writeBytesPerSec)
+              detail: [
+                root.diskKnown ? "/" + root.diskTotalGb.toFixed(0) : root.diskNote,
+                root.coreStale ? "" : "↓" + root.rateText(root.readBytesPerSec)
+                  + " ↑" + root.rateText(root.writeBytesPerSec)
+              ].filter(function(part) { return part !== "" }).join(" · ")
             }
           }
         }
@@ -1574,9 +1680,11 @@ Panel {
     readonly property var info: root.accelState[deviceId] || ({})
     readonly property var facts: root.accelFacts(deviceId)
     readonly property bool asleep: info.asleep === true
+    // Asleep or not answering: either way there is no load to show.
+    readonly property bool quiet: asleep || info.stale === true
 
     spacing: Style.space(12)
-    opacity: asleep ? 0.55 : 1
+    opacity: quiet ? 0.55 : 1
     Behavior on opacity { NumberAnimation { duration: Style.duration(240) } }
 
     Gauge {
@@ -1584,7 +1692,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       busy: cell.info.busy !== undefined ? cell.info.busy : 0
       clock: cell.info.clock !== undefined ? cell.info.clock : -1
-      asleep: cell.asleep
+      asleep: cell.quiet
       tint: root.accelTint(cell.deviceId)
       centerText: root.accelPercentText(cell.deviceId)
     }
