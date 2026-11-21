@@ -86,7 +86,8 @@ number it had. CPU, memory, load and disk rates go together, and GPU, NPU, CPU
 temperature and throttling together. Free space keeps its own check: *not
 responding* once `df` has had 3.5 seconds without answering. When readings
 come back, the first one only sets the base the next is measured against, so
-a stall never ends in a false spike.
+a stall never ends in a false spike, and the graph starts over rather than
+joining the readings either side of the gap.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
 Click *Disk usage* to browse what fills the chosen mount in a floating

@@ -681,8 +681,11 @@ Panel {
     root.prevCoreBusy = ({})
     root.prevCoreTotal = ({})
     root.prevUptime = -1
-    // The core grid empties rather than holding the last loads.
+    // The core grid empties rather than holding the last loads, and the
+    // graph starts over: drawn on, it would join the readings either side
+    // of the gap as if they were one stretch.
     root.coreLoads = root.coreLoads.map(function() { return -1 })
+    root.cpuHistory = []
   }
 
   function rebaseDevices() {
@@ -691,6 +694,7 @@ Panel {
     var marked = {}
     for (var id in root.accelState) marked[id] = Object.assign({}, root.accelState[id], { stale: true })
     root.accelState = marked
+    root.accelHistory = ({})
     root.prevAccel = ({})
     root.prevDeviceUptime = -1
     root.throttleSamples = []
