@@ -90,9 +90,10 @@ a stall never ends in a false spike, and the graph starts over rather than
 joining the readings either side of the gap.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
-Click *Disk usage* to browse what fills the chosen mount in a floating
-terminal. A full scan of `/` takes a while (around 15 seconds on a laptop with
-400 GB in use) before the tree appears.
+Click *Disk usage* to open the chosen mount in
+[disktree](https://github.com/tobi/disktree), Omarchy's disk space treemap. A
+scan of `/` includes btrfs subvolumes such as `/home`. Without disktree, the
+mount opens in a floating terminal instead (see below).
 
 Click the bar widget to open the panel. It registers as a normal bar panel, so
 `SUPER + CTRL + <n>` opens it by position and Tab moves between it and its
@@ -149,7 +150,7 @@ omarchy plugin remove dev.reuk.sysstats
 That deletes `~/.config/omarchy/plugins/dev.reuk.sysstats/` and drops the widget
 from the bar. Nothing else is left behind: the plugin writes no files, no state
 and no configuration of its own, and it installs no services. The only package it
-can install is `dua-cli`, and only if you accept the offer described below. If
+can install is `disktree-bin`, and only if you accept the offer described below. If
 you added a layout entry by hand, remove it from `bar.layout` in
 `~/.config/omarchy/shell.json`.
 
@@ -180,8 +181,8 @@ They live on the widget's entry in `~/.config/omarchy/shell.json`:
 ## What it reads, and what it does not
 
 No network, no services, and nothing is written anywhere. Nothing is installed
-and no privileges are used unless you accept the `dua-cli` offer below, which
-runs `omarchy-pkg-add dua-cli` (pacman, which asks for your password).
+and no privileges are used unless you accept the `disktree-bin` offer below, which
+runs `omarchy-pkg-add disktree-bin` (pacman, which asks for your password).
 
 Every sample runs three short-lived `sh` processes, each on its own so that
 one that hangs cannot hold back the others:
@@ -217,9 +218,10 @@ The device probe reads:
 
 Each sample uses only `coreutils`, `awk` and `grep`, all part of a base Arch
 install. `lspci`, from `pciutils`, runs once at startup to name the devices.
-`btop` is needed only if you open it. *Disk usage* runs
-[`dua`](https://github.com/Byron/dua-cli), or `gdu` or `ncdu` if one of those
-is what you have, and offers to install `dua-cli` if none is.
+`btop` is needed only if you open it. *Disk usage* opens `disktree`, which
+current Omarchy installs. Without it, a floating terminal runs
+[`dua`](https://github.com/Byron/dua-cli), `gdu` or `ncdu`, whichever you have,
+and offers to install `disktree-bin` if none is.
 
 A whole sample costs about 15 ms of CPU, the device probe about 2 ms of
 that. `/proc` is read through a subprocess rather than a `FileView` because
