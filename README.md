@@ -90,10 +90,10 @@ a stall never ends in a false spike, and the graph starts over rather than
 joining the readings either side of the gap.
 
 Press Enter, or click *Open btop* in the footer, for per-process detail.
-Click *Disk usage* to open the chosen mount in
-[disktree](https://github.com/tobi/disktree), Omarchy's disk space treemap. A
-scan of `/` includes btrfs subvolumes such as `/home`. Without disktree, the
-mount opens in a floating terminal instead (see below).
+Click *Disk usage* to open [disktree](https://github.com/tobi/disktree),
+Omarchy's disk space treemap. It starts with its own defaults, on your home
+directory, and any other mount can be picked from its window. Without
+disktree, the chosen mount opens in a floating terminal instead (see below).
 
 Click the bar widget to open the panel. It registers as a normal bar panel, so
 `SUPER + CTRL + <n>` opens it by position and Tab moves between it and its

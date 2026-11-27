@@ -807,24 +807,24 @@ Panel {
     root.close()
   }
 
-  // Browse what fills the storage mount; the mount arrives as $1. disktree,
-  // Omarchy's disk treemap, opens straight on it, and a scan of / includes
-  // btrfs subvolumes such as /home. Without disktree (an older Omarchy), a
-  // floating terminal (TUI.float is the app-id Omarchy floats) runs the TUI
-  // script, $2: dua, then gdu or ncdu if one of those is what's installed;
-  // with none, offer to install disktree. Not --stay-on-filesystem there:
-  // btrfs subvolumes count as other filesystems. dua and gdu skip /proc, /dev,
-  // /sys and /run by default.
+  // Browse what fills the disk. disktree, Omarchy's disk treemap, opens with
+  // its own defaults (the home directory), and any other mount is a choice in
+  // its window. Without disktree (an older Omarchy), a floating terminal
+  // (TUI.float is the app-id Omarchy floats) runs the TUI script, $2, on the
+  // storage mount, $1: dua, then gdu or ncdu if one of those is what's
+  // installed; with none, offer to install disktree. Not --stay-on-filesystem
+  // there: btrfs subvolumes count as other filesystems. dua and gdu skip
+  // /proc, /dev, /sys and /run by default.
   readonly property string diskUsageTuiScript:
     "if command -v dua >/dev/null; then exec dua interactive \"$1\"; " +
     "elif command -v gdu >/dev/null; then exec gdu \"$1\"; " +
     "elif command -v ncdu >/dev/null; then exec ncdu --exclude-kernfs \"$1\"; fi; " +
     "read -rp 'No disk usage analyzer found. Install disktree? [y/N] ' a; " +
-    "case $a in [yY]*) omarchy-pkg-add disktree-bin && setsid -f uwsm-app -- disktree \"$1\" && exit;; esac; " +
+    "case $a in [yY]*) omarchy-pkg-add disktree-bin && setsid -f uwsm-app -- disktree && exit;; esac; " +
     "read -rsn1 -p 'Press any key to close.'"
 
   readonly property string diskUsageScript:
-    "if command -v disktree >/dev/null; then exec uwsm-app -- disktree \"$1\"; fi; " +
+    "if command -v disktree >/dev/null; then exec uwsm-app -- disktree; fi; " +
     "exec omarchy-launch-tui --app-id=TUI.float bash -c \"$2\" disk-usage \"$1\""
 
   function openDiskUsage() {
